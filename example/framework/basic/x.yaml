@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: x
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+  - name: ubuntu
+    image: ubuntu:trusty
+    command: ["sh", "-c", "printenv && sleep 10"]
