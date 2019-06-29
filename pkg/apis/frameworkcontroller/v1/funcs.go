@@ -378,7 +378,7 @@ func (f *Framework) NewFrameworkStatus() *FrameworkStatus {
 	return &FrameworkStatus{
 		StartTime:      meta.Now(),
 		CompletionTime: nil,
-		State:          FrameworkAttemptCreationPending,
+		State:          FrameworkAttemptCreationQueuing,
 		TransitionTime: meta.Now(),
 		RetryPolicyStatus: RetryPolicyStatus{
 			TotalRetriedCount:       0,

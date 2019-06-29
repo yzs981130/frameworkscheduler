@@ -405,9 +405,20 @@ const (
 type FrameworkState string
 
 const (
+        // ConfigMap does not exist and
+        // has not been creation pending.
+        // [StartState]
+        // -> FrameworkAttemptCreationWaiting
+        FrameworkAttemptCreationQueuing FrameworkState = "AttemptCreationQueuing"
+
+        // ConfigMap does not exist and
+        // has not been creation pending.
+        // [WatingState]
+        // -> FrameworkAttemptCreationPending
+        FrameworkAttemptCreationWaiting FrameworkState = "AttemptCreationWaiting"
+
 	// ConfigMap does not exist and
 	// has not been creation requested.
-	// [StartState]
 	// [AttemptStartState]
 	// -> FrameworkAttemptCreationRequested
 	FrameworkAttemptCreationPending FrameworkState = "AttemptCreationPending"

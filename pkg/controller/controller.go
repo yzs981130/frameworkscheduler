@@ -24,31 +24,33 @@ package controller
 
 import (
 	"fmt"
-	"time"
-	"reflect"
-	"strings"
-	log "github.com/sirupsen/logrus"
-	errorWrap "github.com/pkg/errors"
-	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/types"
-	core "k8s.io/api/core/v1"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/util/workqueue"
-	"k8s.io/client-go/util/retry"
-	"k8s.io/client-go/rest"
-	apiErrors "k8s.io/apimachinery/pkg/api/errors"
-	errorAgg "k8s.io/apimachinery/pkg/util/errors"
-	kubeClient "k8s.io/client-go/kubernetes"
-	kubeInformer "k8s.io/client-go/informers"
-	coreLister "k8s.io/client-go/listers/core/v1"
+	ci "github.com/microsoft/frameworkcontroller/pkg/apis/frameworkcontroller/v1"
 	frameworkClient "github.com/microsoft/frameworkcontroller/pkg/client/clientset/versioned"
 	frameworkInformer "github.com/microsoft/frameworkcontroller/pkg/client/informers/externalversions"
 	frameworkLister "github.com/microsoft/frameworkcontroller/pkg/client/listers/frameworkcontroller/v1"
-	ci "github.com/microsoft/frameworkcontroller/pkg/apis/frameworkcontroller/v1"
-	"github.com/microsoft/frameworkcontroller/pkg/util"
 	"github.com/microsoft/frameworkcontroller/pkg/common"
+	"github.com/microsoft/frameworkcontroller/pkg/util"
+	errorWrap "github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
+	core "k8s.io/api/core/v1"
+	apiErrors "k8s.io/apimachinery/pkg/api/errors"
+	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	errorAgg "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	kubeInformer "k8s.io/client-go/informers"
+	kubeClient "k8s.io/client-go/kubernetes"
+	coreLister "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/workqueue"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
 // FrameworkController maintains the lifecycle for all Frameworks in the cluster.
@@ -167,6 +169,9 @@ type FrameworkController struct {
 	//   is AddedAfter later with an earlier duration.
 	fQueue workqueue.RateLimitingInterface
 
+	// GlobalScheduler
+	scheduler *GlobalScheduler
+
 	// fExpectedStatusInfos is used to store the expected Framework.Status info for
 	// all Frameworks.
 	// See ExpectedFrameworkStatusInfo.
@@ -194,6 +199,122 @@ type ExpectedFrameworkStatusInfo struct {
 	remoteSynced bool
 }
 
+type SkdResources struct {
+	CPU    int64
+	Memory int64
+	GPU    int64
+}
+
+type SkdResourceRequirements struct {
+	Limits   SkdResources
+	Requests SkdResources
+}
+
+type SkdNode struct {
+	Key              string
+	ScheduleCategory string
+	ScheduleZone     string
+	Zone             *SkdZone
+	HostIP           string
+	Capacity         SkdResources
+	Allocatable      SkdResources
+	Allocated        SkdResources
+	Free             SkdResources
+	lockOfPods       *sync.RWMutex
+	Pods             map[string]*SkdPod
+	LastInformed     time.Time
+}
+
+type SkdPod struct {
+	Key          string
+	Framework    string
+	HostIP       string
+	Node         *SkdNode
+	Phase        core.PodPhase
+	Condition    core.PodConditionType
+	Resources    SkdResourceRequirements
+	LastInformed time.Time
+}
+
+type SkdFrameworkSpec struct {
+	Pods map[string]*SkdPod
+}
+
+type SkdFrameworkStatus struct {
+	ZoneKey string
+}
+
+type SkdFramework struct {
+	Key              string
+	QueuingTimestamp time.Time
+	ZoneKey          string
+	Zone             *SkdZone
+	Resources        SkdResourceRequirements
+}
+
+type SkdZone struct {
+	Key              string
+	ScheduleCategory string
+	ScnheduleZone    string
+	TotalCapacity    SkdResources
+	TotalAllocated   SkdResources
+	TotalFree        SkdResources
+	TotalProvision   SkdResources
+	lockOfNodes      *sync.RWMutex
+	lockOfWaiting    *sync.RWMutex
+	Nodes            map[string]*SkdNode
+	fmWaiting        map[string]*SkdFramework
+	LastInformed     time.Time
+}
+
+type GlobalScheduler struct {
+	fmQueuing map[string]*SkdFramework
+	fmWaiting map[string]*SkdFramework
+	fmPending map[string]*SkdFramework
+
+	podLister    coreLister.PodLister
+	nodeInformer cache.SharedIndexInformer
+	nodeLister   coreLister.NodeLister
+	fQueue       workqueue.RateLimitingInterface
+
+	lockOfQueuing *sync.RWMutex
+	lockOfWaiting *sync.RWMutex
+	lockOfPending *sync.RWMutex
+
+	lockOfHostIP *sync.RWMutex
+	lockOfNodes  *sync.RWMutex
+	lockOfPods   *sync.RWMutex
+	lockOfZones  *sync.RWMutex
+
+	hostIP2node map[string]string
+	nodes       map[string]string
+	pods        map[string]string
+	zones       map[string]*SkdZone
+	zoneList    []*SkdZone
+
+	lastModifiedZone      time.Time
+	lastRefreshedZoneList time.Time
+}
+
+const (
+	QueueKeyPrefixNode string = "//node/"
+	QueueKeyPrefixPod  string = "//pod/"
+	QueueKeyPrefixZone string = "//zone/"
+
+	DefaultScheduleCategory string = "default"
+	DefaultScheduleZone     string = "default"
+	DefaultZoneKey          string = "default/default"
+
+	AnnotationKeyScheduleCategory  string = "openi.cn/schedule-category"
+	AnnotationKeyScheduleZone      string = "openi.cn/schedule-zone"
+	AnnotationKeySchedulePremotion string = "openi.cn/schedule-premotion"
+
+	LabelKeyScheduleCategory string = AnnotationKeyScheduleCategory
+	LabelKeyScheduleZone     string = AnnotationKeyScheduleZone
+
+	TimeoutOfRefreshZoneList time.Duration = 100 * time.Millisecond
+)
+
 func NewFrameworkController() *FrameworkController {
 	log.Infof("Initializing " + ci.ComponentName)
 
@@ -215,15 +336,47 @@ func NewFrameworkController() *FrameworkController {
 	cmListerInformer := kubeInformer.NewSharedInformerFactory(kClient, 0).Core().V1().ConfigMaps()
 	podListerInformer := kubeInformer.NewSharedInformerFactory(kClient, 0).Core().V1().Pods()
 	fListerInformer := frameworkInformer.NewSharedInformerFactory(fClient, 0).Frameworkcontroller().V1().Frameworks()
+	nodeListerInformer := kubeInformer.NewSharedInformerFactory(kClient, 0).Core().V1().Nodes()
 	cmInformer := cmListerInformer.Informer()
 	podInformer := podListerInformer.Informer()
 	fInformer := fListerInformer.Informer()
+	nodeInformer := nodeListerInformer.Informer()
 	cmLister := cmListerInformer.Lister()
 	podLister := podListerInformer.Lister()
 	fLister := fListerInformer.Lister()
+	nodeLister := nodeListerInformer.Lister()
 
 	// Using DefaultControllerRateLimiter to rate limit on both particular items and overall items.
 	fQueue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+
+	scheduler := &GlobalScheduler{
+		fmQueuing: make(map[string]*SkdFramework),
+		fmWaiting: make(map[string]*SkdFramework),
+		fmPending: make(map[string]*SkdFramework),
+
+		podLister:    podLister,
+		nodeInformer: nodeInformer,
+		nodeLister:   nodeLister,
+		fQueue:       fQueue,
+
+		lockOfQueuing: new(sync.RWMutex),
+		lockOfWaiting: new(sync.RWMutex),
+		lockOfPending: new(sync.RWMutex),
+
+		lockOfHostIP: new(sync.RWMutex),
+		lockOfPods:   new(sync.RWMutex),
+		lockOfNodes:  new(sync.RWMutex),
+		lockOfZones:  new(sync.RWMutex),
+
+		hostIP2node: make(map[string]string),
+		nodes:       make(map[string]string),
+		pods:        make(map[string]string),
+		zones:       make(map[string]*SkdZone),
+		zoneList:    make([]*SkdZone, 0),
+
+		lastModifiedZone:      time.Now(),
+		lastRefreshedZoneList: time.Now(),
+	}
 
 	c := &FrameworkController{
 		kConfig:              kConfig,
@@ -237,6 +390,7 @@ func NewFrameworkController() *FrameworkController {
 		podLister:            podLister,
 		fLister:              fLister,
 		fQueue:               fQueue,
+		scheduler:            scheduler,
 		fExpectedStatusInfos: map[string]*ExpectedFrameworkStatusInfo{},
 	}
 
@@ -272,12 +426,27 @@ func NewFrameworkController() *FrameworkController {
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			c.enqueueFrameworkPodObj(obj, "Framework Pod Added")
+			scheduler.enqueuePodObj(obj, "(******) Pod Added")
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			c.enqueueFrameworkPodObj(newObj, "Framework Pod Updated")
+			scheduler.enqueuePodObj(newObj, "(******) Pod Updated")
 		},
 		DeleteFunc: func(obj interface{}) {
 			c.enqueueFrameworkPodObj(obj, "Framework Pod Deleted")
+			scheduler.enqueuePodObj(obj, "(******) Pod Deleted")
+		},
+	})
+
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			scheduler.enqueueNodeObj(obj, "(******) Node Added")
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			scheduler.enqueueNodeObj(newObj, "(******) Node Updated")
+		},
+		DeleteFunc: func(obj interface{}) {
+			scheduler.enqueueNodeObj(obj, "(******) Node Deleted")
 		},
 	})
 
@@ -318,6 +487,51 @@ func (c *FrameworkController) enqueueFrameworkPodObj(obj interface{}, msg string
 			c.enqueueFrameworkConfigMapObj(cm, msg+": "+pod.Name)
 		}
 	}
+}
+
+// obj could be *core.Pod or cache.DeletedFinalStateUnknown.
+func (s *GlobalScheduler) enqueuePodObj(obj interface{}, msg string) {
+	key, err := util.GetKey(obj)
+	if err != nil {
+		log.Errorf("Failed to get key for pod %#v, skip to enqueue: %v", obj, err)
+		return
+	}
+	s.enqueuePodKey(key)
+	log.Infof("[%v]: enqueuePodObj: %v", key, msg)
+}
+
+// obj could be *core.Node or cache.DeletedFinalStateUnknown.
+func (s *GlobalScheduler) enqueueNodeObj(obj interface{}, msg string) {
+	key, err := util.GetKey(obj)
+	if err != nil {
+		log.Errorf("Failed to get key for node %#v, skip to enqueue: %v", obj, err)
+		return
+	}
+	s.enqueueNodeKey(key)
+	log.Infof("[%v]: enqueueNodeObj: %v", key, msg)
+}
+
+func (s *GlobalScheduler) enqueuePodKey(key string) {
+	s.enqueueKey(QueueKeyPrefixPod, key)
+	log.Infof("[%v]: enqueuePodKey.", key)
+}
+
+func (s *GlobalScheduler) enqueueNodeKey(key string) {
+	s.enqueueKey(QueueKeyPrefixNode, key)
+	log.Infof("[%v]: enqueueNodeKey.", key)
+}
+
+func (s *GlobalScheduler) enqueueZoneKey(key string) {
+	s.enqueueKey(QueueKeyPrefixZone, key)
+	log.Infof("[%v]: enqueueZoneKey.", key)
+}
+
+func (s *GlobalScheduler) enqueueKey(prefix string, key string) {
+	s.fQueue.AddRateLimited(fmt.Sprintf("%v%v", prefix, key))
+}
+
+func (s *GlobalScheduler) enqueueFrameworkKey(key string) {
+	s.fQueue.AddRateLimited(key)
 }
 
 func (c *FrameworkController) getConfigMapOwner(cm *core.ConfigMap) *ci.Framework {
@@ -393,11 +607,13 @@ func (c *FrameworkController) Run(stopCh <-chan struct{}) {
 	go c.fInformer.Run(stopCh)
 	go c.cmInformer.Run(stopCh)
 	go c.podInformer.Run(stopCh)
+	go c.scheduler.nodeInformer.Run(stopCh)
 	if !cache.WaitForCacheSync(
 		stopCh,
 		c.fInformer.HasSynced,
 		c.cmInformer.HasSynced,
-		c.podInformer.HasSynced) {
+		c.podInformer.HasSynced,
+		c.scheduler.nodeInformer.HasSynced) {
 		panic("Failed to WaitForCacheSync")
 	}
 
@@ -433,7 +649,16 @@ func (c *FrameworkController) processNextWorkItem(id int32) bool {
 	// same item again.
 	defer c.fQueue.Done(key)
 
-	err := c.syncFramework(key.(string))
+	var err error
+	if HasPrefixPod(key) {
+		err = c.scheduler.syncPod(GetPodKey(key))
+	} else if HasPrefixNode(key) {
+		err = c.scheduler.syncNode(GetNodeKey(key))
+	} else if HasPrefixZone(key) {
+		err = c.scheduler.syncZone(GetZoneKey(key))
+	} else {
+		err = c.syncFramework(key.(string))
+	}
 	if err == nil {
 		// Reset the rate limit counters of the item in the queue, such as NumRequeues,
 		// because we have synced it successfully.
@@ -443,6 +668,844 @@ func (c *FrameworkController) processNextWorkItem(id int32) bool {
 	}
 
 	return true
+}
+
+func HasPrefixPod(key interface{}) bool {
+	return strings.HasPrefix(key.(string), QueueKeyPrefixPod)
+}
+
+func HasPrefixNode(key interface{}) bool {
+	return strings.HasPrefix(key.(string), QueueKeyPrefixNode)
+}
+
+func HasPrefixZone(key interface{}) bool {
+	return strings.HasPrefix(key.(string), QueueKeyPrefixZone)
+}
+
+func GetPodKey(key interface{}) string {
+	return key.(string)[len(QueueKeyPrefixPod):]
+}
+
+func GetNodeKey(key interface{}) string {
+	return key.(string)[len(QueueKeyPrefixNode):]
+}
+
+func GetZoneKey(key interface{}) string {
+	return key.(string)[len(QueueKeyPrefixZone):]
+}
+
+func (s *GlobalScheduler) lookupNodeKeyByPod(key string) (string, bool) {
+	ReadLock(s.lockOfPods)
+	defer ReadUnlock(s.lockOfPods)
+	nodeKey, ok := s.pods[key]
+	if ok {
+		return nodeKey, true
+	} else {
+		return "", false
+	}
+}
+
+func (s *GlobalScheduler) lookupZoneKeyByNode(key string) (string, bool) {
+	ReadLock(s.lockOfNodes)
+	defer ReadUnlock(s.lockOfNodes)
+	zoneKey, ok := s.nodes[key]
+	if ok {
+		return zoneKey, true
+	} else {
+		return "", false
+	}
+}
+
+func (s *GlobalScheduler) cleanupPodKey(key string) {
+	WriteLock(s.lockOfPods)
+	defer WriteUnlock(s.lockOfPods)
+	delete(s.pods, key)
+}
+
+func (s *GlobalScheduler) cleanupNodeKey(key string) {
+	WriteLock(s.lockOfNodes)
+	defer WriteUnlock(s.lockOfNodes)
+	delete(s.nodes, key)
+}
+
+func (s *GlobalScheduler) lookupPodByKey(key string) *SkdPod {
+	nodeKey, ok := s.lookupNodeKeyByPod(key)
+	if !ok {
+		return nil
+	}
+	skdNode := s.lookupNodeByKey(nodeKey)
+	if skdNode == nil {
+		return nil
+	}
+	ReadLock(skdNode.lockOfPods)
+	defer ReadUnlock(skdNode.lockOfPods)
+	skdPod, exists := skdNode.Pods[key]
+	if exists {
+		return skdPod
+	}
+	return nil
+}
+
+func (s *GlobalScheduler) lookupNodeByKey(key string) *SkdNode {
+	zoneKey, ok := s.lookupZoneKeyByNode(key)
+	if !ok {
+		return nil
+	}
+	skdZone := s.lookupZoneByKey(zoneKey)
+	if skdZone == nil {
+		return nil
+	}
+	ReadLock(skdZone.lockOfNodes)
+	defer ReadUnlock(skdZone.lockOfNodes)
+	skdNode, exists := skdZone.Nodes[key]
+	if exists {
+		return skdNode
+	}
+	return nil
+}
+
+func (s *GlobalScheduler) lookupZoneByKey(key string) *SkdZone {
+	ReadLock(s.lockOfZones)
+	defer ReadUnlock(s.lockOfZones)
+	skdZone, exists := s.zones[key]
+	if exists {
+		return skdZone
+	}
+	return nil
+}
+
+func (s *GlobalScheduler) addPodToNode(skdPod *SkdPod) error {
+	nodeKey, ok := s.lookupNodeKeyByHostIP(skdPod.HostIP)
+	if !ok {
+		return fmt.Errorf("[%v] addPodToNode: Node with HostIP(=%v) is NOT found!",
+			skdPod.Key, skdPod.HostIP)
+	}
+	skdNode := s.lookupNodeByKey(nodeKey)
+	if skdNode == nil {
+		return fmt.Errorf("[%v] addPodToNode: Node(=%v) does not exist!",
+			skdPod.Key, nodeKey)
+	}
+	// Add skdPod to skdNode
+	WriteLock(skdNode.lockOfPods)
+	func() {
+		defer WriteUnlock(skdNode.lockOfPods)
+		skdNode.Pods[skdPod.Key] = skdPod
+		skdPod.Node = skdNode
+	}()
+	// Add the map of {skdPod.Key -> skdNode.Key}
+	WriteLock(s.lockOfPods)
+	func() {
+		defer WriteUnlock(s.lockOfPods)
+		s.pods[skdPod.Key] = nodeKey
+	}()
+	// pods in node changed, notify the node
+	s.enqueueNodeKey(nodeKey)
+	return nil
+}
+
+func (s *GlobalScheduler) addNodeToZone(skdNode *SkdNode) {
+	zoneKey := ToZoneKey(skdNode.ScheduleCategory, skdNode.ScheduleZone)
+	skdZone := s.lookupZoneByKey(zoneKey)
+	if skdZone == nil {
+		skdZone = s.createZone(skdNode.ScheduleCategory, skdNode.ScheduleZone)
+	}
+	// Add skdNode to skdZone
+	WriteLock(skdZone.lockOfNodes)
+	func() {
+		defer WriteUnlock(skdZone.lockOfNodes)
+		skdZone.Nodes[skdNode.Key] = skdNode
+		skdNode.Zone = skdZone
+	}()
+	// Add the map of {skdNode.Key -> skdZone.Key}
+	WriteLock(s.lockOfNodes)
+	func() {
+		defer WriteUnlock(s.lockOfNodes)
+		s.nodes[skdNode.Key] = zoneKey
+	}()
+	// nodes in zone changed, notify the zone
+	s.enqueueZoneKey(zoneKey)
+}
+
+func (s *GlobalScheduler) createZone(category string, zone string) *SkdZone {
+	zoneKey := ToZoneKey(category, zone)
+	skdZone := &SkdZone{
+		Key:              zoneKey,
+		ScheduleCategory: category,
+		ScnheduleZone:    zone,
+		TotalCapacity:    SkdResources{0, 0, 0},
+		TotalAllocated:   SkdResources{0, 0, 0},
+		TotalFree:        SkdResources{0, 0, 0},
+		TotalProvision:   SkdResources{0, 0, 0},
+		lockOfNodes:      new(sync.RWMutex),
+		lockOfWaiting:    new(sync.RWMutex),
+		Nodes:            make(map[string]*SkdNode),
+		fmWaiting:        make(map[string]*SkdFramework),
+		LastInformed:     time.Now(),
+	}
+	WriteLock(s.lockOfZones)
+	defer WriteUnlock(s.lockOfZones)
+	s.zones[zoneKey] = skdZone
+	return skdZone
+}
+
+func (s *GlobalScheduler) deletePod(skdPod *SkdPod) {
+	skdNode := skdPod.Node
+	if skdNode != nil {
+		// Delete pod from node
+		WriteLock(skdNode.lockOfPods)
+		func() {
+			defer WriteUnlock(skdNode.lockOfPods)
+			skdPod.Node = nil
+			delete(skdNode.Pods, skdPod.Key)
+		}()
+		// Pods in node are changed, notify the node
+		s.enqueueNodeKey(skdNode.Key)
+	}
+	s.cleanupPodKey(skdPod.Key)
+}
+
+func (s *GlobalScheduler) deleteNode(skdNode *SkdNode) {
+	skdZone := skdNode.Zone
+	if skdZone != nil {
+		// Delete node from zone
+		WriteLock(skdZone.lockOfNodes)
+		func() {
+			defer WriteUnlock(skdZone.lockOfNodes)
+			skdNode.Zone = nil
+			delete(skdZone.Nodes, skdNode.Key)
+		}()
+		// Nodes in zone are changed, notify the zone
+		s.enqueueZoneKey(skdZone.Key)
+	}
+	s.cleanupNodeKey(skdNode.Key)
+}
+
+func (s *GlobalScheduler) deleteZone(skdZone *SkdZone) {
+	WriteLock(s.lockOfZones)
+	defer WriteUnlock(s.lockOfZones)
+	delete(s.zones, skdZone.Key)
+}
+
+func (s *GlobalScheduler) deletePodByKey(key string) {
+	skdPod := s.lookupPodByKey(key)
+	if skdPod != nil {
+		s.deletePod(skdPod)
+	} else {
+		s.cleanupPodKey(key)
+	}
+}
+
+func (s *GlobalScheduler) deleteNodeByKey(key string) {
+	skdNode := s.lookupNodeByKey(key)
+	if skdNode != nil {
+		s.deleteNode(skdNode)
+	} else {
+		s.cleanupNodeKey(key)
+	}
+}
+
+func (s *GlobalScheduler) syncPod(key string) (returnedErr error) {
+	startTime := time.Now()
+	logPfx := fmt.Sprintf("[%v]: syncPod: ", key)
+	log.Infof(logPfx + "Started")
+	defer func() {
+		if returnedErr != nil {
+			// returnedErr is already prefixed with logPfx
+			log.Warnf(returnedErr.Error())
+			log.Warnf(logPfx +
+				"Failed to due to Platform Transient Error. " +
+				"Will enqueue it again after rate limited delay")
+		}
+		log.Infof(logPfx+"Completed: Duration %v", time.Since(startTime))
+	}()
+
+	namespace, name, err := util.SplitKey(key)
+	if err != nil {
+		// Unreachable
+		panic(fmt.Errorf(logPfx+
+			"Failed: Got invalid key from queue, but the queue should only contain "+
+			"valid keys: %v", err))
+	}
+
+	pod, err := s.podLister.Pods(namespace).Get(name)
+	if err != nil {
+		if apiErrors.IsNotFound(err) {
+			// GarbageCollectionController will handle the dependent object
+			// deletion according to the ownerReferences.
+			log.Infof(logPfx+"Skipped: Pod is not in local cache: %v", err)
+			s.deletePodByKey(key)
+			return nil
+		} else {
+			return fmt.Errorf(logPfx+"Failed: Pod is not in local cache: %v", err)
+		}
+	}
+	if pod.DeletionTimestamp != nil {
+		// Skip syncPod to avoid fighting with GarbageCollectionController,
+		// because GarbageCollectionController may be deleting the dependent object.
+		log.Infof(logPfx+"Skipped: Pod on node %v is to be deleted", key)
+		s.deletePodByKey(key)
+		return nil
+	}
+	skdPod := s.lookupPodByKey(key)
+	if skdPod != nil {
+		skdPod.LastInformed = time.Now()
+		if skdPod.Phase != pod.Status.Phase {
+			log.Infof(logPfx+"Skipped: Phase changes from %v to %v",
+				skdPod.Phase, pod.Status.Phase)
+		}
+		skdPod.Phase = pod.Status.Phase
+		if skdPod.HostIP != pod.Status.HostIP {
+			skdPod.HostIP = pod.Status.HostIP
+			// Unreachable!
+			// HostIP should not be changed.
+			log.Infof(logPfx+"Error: HostIP changed! %v -> %v",
+				skdPod.HostIP, pod.Status.HostIP)
+		}
+		skdNode := skdPod.Node
+		if skdNode != nil && skdNode.HostIP != skdPod.HostIP {
+			log.Infof(logPfx+"Pod (%v@%v) is not on the Node(%v)!",
+				skdPod.Key, skdPod.HostIP, skdNode.HostIP)
+			s.deletePod(skdPod)
+			err := s.addPodToNode(skdPod)
+			if err != nil {
+				log.Infof(logPfx+"Fail: %v", err)
+				s.enqueuePodKey(skdPod.Key)
+			}
+		}
+		return nil
+	}
+	if len(pod.Status.HostIP) == 0 {
+		return nil
+	}
+	frameworkKey := GetPodFrameworkKey(pod)
+	limits := GetPodResourceLimits(pod)
+	requests := GetPodResourceRequests(pod)
+	hostIP := pod.Status.HostIP
+	phase := pod.Status.Phase
+	skdPod = &SkdPod{
+		Key:       key,
+		Framework: frameworkKey,
+		HostIP:    hostIP,
+		Node:      nil,
+		Phase:     phase,
+		Resources: SkdResourceRequirements{
+			Limits:   limits,
+			Requests: requests,
+		},
+		LastInformed: time.Now(),
+	}
+	err = s.addPodToNode(skdPod)
+	if err != nil {
+		return fmt.Errorf(logPfx+"Fail: Add Pod to local cache! %v", err)
+	}
+	return nil
+}
+
+func ReadLock(lock *sync.RWMutex) {
+	lock.RLock()
+	//log.Infof("RLock %v", lock)
+}
+
+func ReadUnlock(lock *sync.RWMutex) {
+	//log.Infof("RUnock %v", lock)
+	lock.RUnlock()
+}
+
+func WriteLock(lock *sync.RWMutex) {
+	//log.Infof("try WLock %v", lock)
+	lock.Lock()
+	//log.Infof("WLock %v", lock)
+}
+
+func WriteUnlock(lock *sync.RWMutex) {
+	//log.Infof("WUnock %v", lock)
+	lock.Unlock()
+}
+
+func (s *GlobalScheduler) lookupNodeKeyByHostIP(hostIP string) (string, bool) {
+	ReadLock(s.lockOfHostIP)
+	defer ReadUnlock(s.lockOfHostIP)
+	nodeKey, ok := s.hostIP2node[hostIP]
+	if ok {
+		return nodeKey, ok
+	} else {
+		return "", false
+	}
+}
+
+func (s *GlobalScheduler) setupHostIPtoNodeKey(hostIP string, nodeKey string) {
+	log.Infof("try map HostIP(=%v) to Node(=%v)", hostIP, nodeKey)
+	WriteLock(s.lockOfHostIP)
+	defer WriteUnlock(s.lockOfHostIP)
+	s.hostIP2node[hostIP] = nodeKey
+	log.Infof("map HostIP(=%v) to Node(=%v)", hostIP, nodeKey)
+}
+
+func (s *GlobalScheduler) cleanupHostIP(hostIP string) {
+	WriteLock(s.lockOfHostIP)
+	defer WriteUnlock(s.lockOfHostIP)
+	delete(s.hostIP2node, hostIP)
+}
+
+func GetPodFrameworkName(kPod *core.Pod) string {
+	if name, ok := kPod.Labels[ci.LabelKeyFrameworkName]; ok {
+		return name
+	}
+	return ""
+}
+
+func GetPodFrameworkKey(kPod *core.Pod) string {
+	fname := GetPodFrameworkName(kPod)
+	if len(fname) > 0 {
+		return fmt.Sprintf("%v/%v", kPod.Namespace, fname)
+	}
+	return ""
+}
+
+func GetCPUQuantity(resList core.ResourceList) int64 {
+	if q, ok := resList[core.ResourceCPU]; ok {
+		val := q.ScaledValue(-3)
+		//log.Infof("CPU: %v (%v)", q, val)
+		return val
+	}
+	return 0
+}
+
+func GetMemoryQuantity(resList core.ResourceList) int64 {
+	if q, ok := resList[core.ResourceMemory]; ok {
+		val := q.ScaledValue(0) / (1024 * 1024)
+		//log.Infof("Memory: %v (%v)", q, val)
+		return val
+	}
+	return 0
+}
+
+func GetGPUQuantity(resList core.ResourceList) int64 {
+	if q, ok := resList[core.ResourceNvidiaGPU]; ok {
+		val := q.ScaledValue(0)
+		//log.Infof("GPU: %v (%v)", q, val)
+		return val
+	}
+	return 0
+}
+
+func GetPodResourceLimits(kPod *core.Pod) (res SkdResources) {
+	res = SkdResources{0, 0, 0}
+	for _, c := range kPod.Spec.Containers {
+		res.CPU += GetCPUQuantity(c.Resources.Limits)
+		res.Memory += GetMemoryQuantity(c.Resources.Limits)
+		res.GPU += GetGPUQuantity(c.Resources.Limits)
+	}
+	return res
+}
+
+func GetPodResourceRequests(kPod *core.Pod) (res SkdResources) {
+	res = SkdResources{0, 0, 0}
+	for _, c := range kPod.Spec.Containers {
+		res.CPU += GetCPUQuantity(c.Resources.Requests)
+		res.Memory += GetMemoryQuantity(c.Resources.Requests)
+		res.GPU += GetGPUQuantity(c.Resources.Requests)
+	}
+	return res
+}
+
+func (s *GlobalScheduler) syncNode(key string) (returnedErr error) {
+	startTime := time.Now()
+	logPfx := fmt.Sprintf("[%v]: syncNode: ", key)
+	log.Infof(logPfx + "Started")
+	defer func() {
+		if returnedErr != nil {
+			// returnedErr is already prefixed with logPfx
+			log.Warnf(returnedErr.Error())
+			log.Warnf(logPfx +
+				"Failed to due to Platform Transient Error. " +
+				"Will enqueue it again after rate limited delay")
+		}
+		log.Infof(logPfx+"Completed: Duration %v", time.Since(startTime))
+	}()
+
+	node, err := s.nodeLister.Get(key)
+	if err != nil {
+		if apiErrors.IsNotFound(err) {
+			// GarbageCollectionController will handle the dependent object
+			// deletion according to the ownerReferences.
+			log.Infof(logPfx+
+				"Skipped: Node cannot be found in local cache: %v", err)
+			s.deleteNodeByKey(key)
+			return nil
+		} else {
+			return fmt.Errorf(logPfx+
+				"Failed: Node cannot be got from local cache: %v", err)
+		}
+	}
+	if node.DeletionTimestamp != nil {
+		// Skip syncFramework to avoid fighting with GarbageCollectionController,
+		// because GarbageCollectionController may be deleting the dependent object.
+		log.Infof(logPfx+
+			"Skipped: Node cannot be found in local cache: %v", err)
+		s.deleteNodeByKey(key)
+		return nil
+	}
+	var oldZoneKey string = ""
+	var zoneKey string = ""
+	skdNode := s.lookupNodeByKey(key)
+	if skdNode != nil {
+		oldZoneKey = skdNode.Zone.Key
+		category := GetNodeLabelValue(node,
+			LabelKeyScheduleCategory, DefaultScheduleCategory)
+		zone := GetNodeLabelValue(node, LabelKeyScheduleZone, DefaultScheduleZone)
+		zoneKey = ToZoneKey(category, zone)
+		if oldZoneKey != zoneKey {
+			s.deleteNode(skdNode)
+			skdNode.ScheduleCategory = category
+			skdNode.ScheduleZone = zone
+			s.addNodeToZone(skdNode)
+		}
+		skdNode.Capacity = GetNodeCapacity(node)
+		skdNode.Allocatable = GetNodeAllocatable(node)
+		hostIP := GetNodeHostIP(node)
+		if skdNode.HostIP != hostIP {
+			log.Infof(logPfx+"Unexpected: Node's Host IP changed, %v->%v on %v",
+				skdNode.HostIP, hostIP, key)
+			s.cleanupHostIP(skdNode.HostIP)
+			skdNode.HostIP = hostIP
+			s.setupHostIPtoNodeKey(hostIP, key)
+		}
+		skdNode.LastInformed = time.Now()
+		log.Infof(logPfx+"OK: skdNode exists: %v", key)
+	} else {
+		category := GetNodeLabelValue(node,
+			LabelKeyScheduleCategory, DefaultScheduleCategory)
+		zone := GetNodeLabelValue(node, LabelKeyScheduleZone, DefaultScheduleZone)
+		zoneKey = ToZoneKey(category, zone)
+		capacity := GetNodeCapacity(node)
+		allocatable := GetNodeAllocatable(node)
+		hostIP := GetNodeHostIP(node)
+		skdNode = &SkdNode{
+			Key:              key,
+			ScheduleCategory: category,
+			ScheduleZone:     zone,
+			Zone:             nil,
+			HostIP:           hostIP,
+			Capacity:         capacity,
+			Allocatable:      allocatable,
+			Allocated:        SkdResources{0, 0, 0},
+			Free:             SkdResources{0, 0, 0},
+			lockOfPods:       new(sync.RWMutex),
+			Pods:             make(map[string]*SkdPod),
+			LastInformed:     time.Now(),
+		}
+		s.setupHostIPtoNodeKey(hostIP, key)
+		s.addNodeToZone(skdNode)
+		log.Infof(logPfx+"Add new skdNode to local cache: %v", key)
+	}
+
+	// Calculate free resources
+	skdNode.Allocated = SkdResources{0, 0, 0}
+	ReadLock(skdNode.lockOfPods)
+	func() {
+		defer ReadUnlock(skdNode.lockOfPods)
+		for _, skdPod := range skdNode.Pods {
+			if skdPod.HostIP != skdNode.HostIP {
+				continue
+			}
+			if skdPod.Resources.Limits.CPU > skdPod.Resources.Requests.CPU {
+				skdNode.Allocated.CPU += skdPod.Resources.Limits.CPU
+			} else {
+				skdNode.Allocated.CPU += skdPod.Resources.Requests.CPU
+			}
+			if skdPod.Resources.Limits.Memory > skdPod.Resources.Requests.Memory {
+				skdNode.Allocated.Memory += skdPod.Resources.Limits.Memory
+			} else {
+				skdNode.Allocated.Memory += skdPod.Resources.Requests.Memory
+			}
+			if skdPod.Resources.Limits.GPU > skdPod.Resources.Requests.GPU {
+				skdNode.Allocated.GPU += skdPod.Resources.Limits.GPU
+			} else {
+				skdNode.Allocated.GPU += skdPod.Resources.Requests.GPU
+			}
+			if !strings.HasPrefix(skdPod.Key, "kube-system/") {
+				log.Infof(logPfx+"lim=%v req=%v on %v",
+					skdPod.Resources.Limits, skdPod.Resources.Requests, skdPod.Key)
+			}
+		}
+	}()
+	skdNode.Free.CPU = skdNode.Capacity.CPU - skdNode.Allocated.CPU
+	skdNode.Free.Memory = skdNode.Capacity.Memory - skdNode.Allocated.Memory
+	skdNode.Free.GPU = skdNode.Capacity.GPU - skdNode.Allocated.GPU
+	log.Infof(logPfx+"capacity=%v allocated=%v on //%v",
+		skdNode.Capacity, skdNode.Allocated, skdNode.Key)
+	s.enqueueZoneKey(zoneKey)
+	return nil
+}
+
+func EncodeKey(key string) string {
+	key = strings.ReplaceAll(key, "%", "%25")
+	key = strings.ReplaceAll(key, "/", "%2f")
+	return key
+}
+
+func DecodeKey(key string) string {
+	key = strings.ReplaceAll(key, "%2f", "/")
+	key = strings.ReplaceAll(key, "%25", "%")
+	return key
+}
+
+func ToZoneKey(category string, zone string) string {
+	log.Infof("%v/%v", category, zone)
+	category = EncodeKey(category)
+	zone = EncodeKey(zone)
+	log.Infof("%v/%v %v/%v", category, zone, DecodeKey(category), DecodeKey(zone))
+	return fmt.Sprintf("%v/%v", category, zone)
+}
+
+func GetNodeHostIP(node *core.Node) string {
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == core.NodeInternalIP {
+			return addr.Address
+		}
+	}
+	log.Infof("Node %v has no internal ip: %v", node.Status.Addresses)
+	return ""
+}
+
+func GetNodeLabelValue(node *core.Node, label string, defaultValue string) string {
+	if val, ok := node.Labels[label]; ok {
+		return val
+	}
+	return defaultValue
+}
+
+func GetNodeCapacity(node *core.Node) SkdResources {
+	return SkdResources{
+		GetCPUQuantity(node.Status.Capacity),
+		GetMemoryQuantity(node.Status.Capacity),
+		GetGPUQuantity(node.Status.Capacity),
+	}
+}
+
+func GetNodeAllocatable(node *core.Node) SkdResources {
+	return SkdResources{
+		GetCPUQuantity(node.Status.Allocatable),
+		GetMemoryQuantity(node.Status.Allocatable),
+		GetGPUQuantity(node.Status.Allocatable),
+	}
+}
+
+func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
+	startTime := time.Now()
+	logPfx := fmt.Sprintf("[%v]: syncZone: ", key)
+	log.Infof(logPfx + "Started")
+	defer func() {
+		if returnedErr != nil {
+			// returnedErr is already prefixed with logPfx
+			log.Warnf(returnedErr.Error())
+			log.Warnf(logPfx +
+				"Failed to due to Platform Transient Error. " +
+				"Will enqueue it again after rate limited delay")
+		}
+		log.Infof(logPfx+"Completed: Duration %v", time.Since(startTime))
+	}()
+
+	category, zone, err := util.SplitKey(key)
+
+	if err != nil {
+		// Unreachable
+		panic(fmt.Errorf(logPfx+
+			"Failed: Got invalid key from queue, but the queue should only contain "+
+			"valid keys: %v", err))
+	}
+
+	category = DecodeKey(category)
+	zone = DecodeKey(zone)
+	skdZone := s.lookupZoneByKey(key)
+	if skdZone == nil {
+		skdZone = s.createZone(category, zone)
+	}
+
+	skdZone.LastInformed = time.Now()
+
+	skdZone.RefreshTotalCapacityAndFree()
+
+	if skdZone.HasFreeProvision() {
+		fwk := s.ScheduleWaitingForZone(skdZone)
+		if fwk != nil {
+			if fwk.Zone == skdZone {
+				s.ScheduleWaitingToZone(fwk, skdZone)
+				log.Infof(logPfx+"ScheduleWaitingToZone(%v)", fwk.Key)
+			} else {
+				log.Infof(logPfx+"ScheduleWaitingForZone(%v)", fwk.Key)
+				s.enqueueFrameworkKey(fwk.Key)
+			}
+		} else {
+			fwk = s.ScheduleQueuingFramework()
+			if fwk != nil {
+				log.Infof(logPfx+"ScheduleQueuingFramework(%v)", fwk.Key)
+				s.enqueueFrameworkKey(fwk.Key)
+			}
+		}
+	}
+
+	if skdZone.HasFreeResources() {
+		fwk := s.ScheduleWaitingFramework(skdZone)
+		if (fwk != nil) {
+			log.Infof(logPfx+"ScheduleWaitingFramework(%v)", fwk.Key)
+			s.enqueueFrameworkKey(fwk.Key)
+		}
+	}
+
+	s.lastModifiedZone = time.Now()
+
+	return nil
+}
+
+func (z *SkdZone) RefreshTotalCapacityAndFree() {
+	var keys []string
+	totalCapacity := SkdResources{0, 0, 0}
+	totalFree := SkdResources{0, 0, 0}
+
+	ReadLock(z.lockOfNodes)
+	func() {
+		defer ReadUnlock(z.lockOfNodes)
+		keys = make([]string, 0, len(z.Nodes))
+		for key, skdNode := range z.Nodes {
+			keys = append(keys, key)
+			totalCapacity.CPU += skdNode.Capacity.CPU
+			totalCapacity.Memory += skdNode.Capacity.Memory
+			totalCapacity.GPU += skdNode.Capacity.GPU
+			totalFree.CPU += skdNode.Free.CPU
+			totalFree.Memory += skdNode.Free.Memory
+			totalFree.GPU += skdNode.Free.GPU
+		}
+	}()
+
+	z.TotalCapacity = totalCapacity
+	z.TotalFree = totalFree
+
+	log.Infof("[%v] syncZone: nodes={%v}", z.Key, strings.Join(keys, ","))
+
+	log.Infof("[%v] syncZone: cap=%v free=%v", z.Key, totalCapacity, totalFree)
+}
+
+func (z *SkdZone) HasFreeProvision() bool {
+	provision := z.TotalProvision
+	capacity := z.TotalCapacity
+	if capacity.GPU < provision.GPU {
+		return false
+	}
+	if capacity.CPU < provision.CPU {
+		return false
+	}
+	if capacity.Memory < provision.Memory {
+		return false
+	}
+	return true
+}
+
+func (z *SkdZone) HasFreeResources() bool {
+	free := z.TotalFree
+	if free.GPU < 0 {
+		return false
+	}
+	if free.CPU < 0 {
+		return false
+	}
+	if free.Memory < 0 {
+		return false
+	}
+	return true
+}
+
+func (s *GlobalScheduler) ScheduleWaitingForZone(skdZone *SkdZone) *SkdFramework {
+	ReadLock(s.lockOfWaiting)
+	defer ReadUnlock(s.lockOfWaiting)
+	var nextWaitingForAny *SkdFramework = nil
+	for _, fwk := range s.fmWaiting {
+		if nextWaitingForAny == nil {
+			if len(fwk.ZoneKey) == 0 {
+				nextWaitingForAny = fwk
+			}
+		}
+		if fwk.Zone == skdZone {
+			return fwk
+		}
+		if fwk.ZoneKey == skdZone.Key {
+			return fwk
+		}
+	}
+	if nextWaitingForAny != nil {
+		nextWaitingForAny.ZoneKey = skdZone.Key
+	}
+	return nextWaitingForAny
+}
+
+func (s *GlobalScheduler) ScheduleWaitingToZone(fwk *SkdFramework, skdZone *SkdZone) {
+	WriteLock(s.lockOfWaiting)
+	func() {
+		defer WriteUnlock(s.lockOfWaiting)
+		delete(s.fmWaiting, fwk.Key)
+	}()
+	WriteLock(skdZone.lockOfWaiting)
+	func() {
+		defer WriteUnlock(skdZone.lockOfWaiting)
+		skdZone.fmWaiting[fwk.Key] = fwk
+	}()
+}
+
+func (s *GlobalScheduler) ScheduleQueuingFramework() *SkdFramework {
+	var nextWaiting *SkdFramework = nil
+	ReadLock(s.lockOfQueuing)
+	func() {
+		defer ReadUnlock(s.lockOfQueuing)
+		for _, fwk := range s.fmQueuing {
+			if nextWaiting == nil {
+				nextWaiting = fwk
+			} else if fwk.QueuingTimestamp.Before(nextWaiting.QueuingTimestamp) {
+				nextWaiting = fwk
+			}
+		}
+	}()
+	if nextWaiting != nil {
+		WriteLock(s.lockOfWaiting)
+		func() {
+			defer WriteUnlock(s.lockOfWaiting)
+			s.fmWaiting[nextWaiting.Key] = nextWaiting
+		}()
+		WriteLock(s.lockOfQueuing)
+		func() {
+			defer WriteUnlock(s.lockOfQueuing)
+			delete(s.fmQueuing, nextWaiting.Key)
+		}()
+	}
+	return nextWaiting
+}
+
+func (s *GlobalScheduler) ScheduleWaitingFramework(skdZone *SkdZone) *SkdFramework {
+	var nextPending *SkdFramework = nil
+	ReadLock(skdZone.lockOfWaiting)
+	func() {
+		defer ReadUnlock(skdZone.lockOfWaiting)
+		for _, fwk := range skdZone.fmWaiting {
+			if nextPending == nil {
+				nextPending = fwk
+			} else if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
+				nextPending = fwk
+			}
+		}
+	}()
+	if nextPending != nil {
+		WriteLock(s.lockOfPending)
+		func() {
+			defer WriteUnlock(s.lockOfPending)
+			s.fmPending[nextPending.Key] = nextPending
+		}()
+		WriteLock(skdZone.lockOfWaiting)
+		func() {
+			defer WriteUnlock(skdZone.lockOfWaiting)
+			delete(skdZone.fmWaiting, nextPending.Key)
+		}()
+	}
+	return nextPending
 }
 
 // It should not be invoked concurrently with the same key.
@@ -460,8 +1523,8 @@ func (c *FrameworkController) syncFramework(key string) (returnedErr error) {
 			// returnedErr is already prefixed with logPfx
 			log.Warnf(returnedErr.Error())
 			log.Warnf(logPfx +
-					"Failed to due to Platform Transient Error. " +
-					"Will enqueue it again after rate limited delay")
+				"Failed to due to Platform Transient Error. " +
+				"Will enqueue it again after rate limited delay")
 		}
 		log.Infof(logPfx+"Completed: Duration %v", time.Since(startTime))
 	}()
@@ -470,8 +1533,8 @@ func (c *FrameworkController) syncFramework(key string) (returnedErr error) {
 	if err != nil {
 		// Unreachable
 		panic(fmt.Errorf(logPfx+
-				"Failed: Got invalid key from queue, but the queue should only contain "+
-				"valid keys: %v", err))
+			"Failed: Got invalid key from queue, but the queue should only contain "+
+			"valid keys: %v", err))
 	}
 
 	localF, err := c.fLister.Frameworks(namespace).Get(name)
@@ -480,19 +1543,19 @@ func (c *FrameworkController) syncFramework(key string) (returnedErr error) {
 			// GarbageCollectionController will handle the dependent object
 			// deletion according to the ownerReferences.
 			log.Infof(logPfx+
-					"Skipped: Framework cannot be found in local cache: %v", err)
+				"Skipped: Framework cannot be found in local cache: %v", err)
 			c.deleteExpectedFrameworkStatusInfo(key)
 			return nil
 		} else {
 			return fmt.Errorf(logPfx+
-					"Failed: Framework cannot be got from local cache: %v", err)
+				"Failed: Framework cannot be got from local cache: %v", err)
 		}
 	} else {
 		if localF.DeletionTimestamp != nil {
 			// Skip syncFramework to avoid fighting with GarbageCollectionController,
 			// because GarbageCollectionController may be deleting the dependent object.
 			log.Infof(logPfx+
-					"Skipped: Framework is deleting: Will be deleted at %v",
+				"Skipped: Framework is deleting: Will be deleted at %v",
 				localF.DeletionTimestamp)
 			return nil
 		} else {
@@ -547,8 +1610,8 @@ func (c *FrameworkController) syncFramework(key string) (returnedErr error) {
 				c.updateExpectedFrameworkStatusInfo(f.Key(), f.Status, updateErr == nil)
 			} else {
 				log.Infof(logPfx +
-						"Skip to update the expected and remote Framework.Status since " +
-						"they are unchanged")
+					"Skip to update the expected and remote Framework.Status since " +
+					"they are unchanged")
 			}
 
 			return errorAgg.NewAggregate(errs)
@@ -587,7 +1650,7 @@ func (c *FrameworkController) recoverTimeoutChecks(f *ci.Framework) {
 }
 
 func (c *FrameworkController) enqueueFrameworkAttemptCreationTimeoutCheck(
-		f *ci.Framework, failIfTimeout bool) bool {
+	f *ci.Framework, failIfTimeout bool) bool {
 	if f.Status.State != ci.FrameworkAttemptCreationRequested {
 		return false
 	}
@@ -606,8 +1669,8 @@ func (c *FrameworkController) enqueueFrameworkAttemptCreationTimeoutCheck(
 }
 
 func (c *FrameworkController) enqueueTaskAttemptCreationTimeoutCheck(
-		f *ci.Framework, taskRoleName string, taskIndex int32,
-		failIfTimeout bool) bool {
+	f *ci.Framework, taskRoleName string, taskIndex int32,
+	failIfTimeout bool) bool {
 	taskStatus := f.TaskStatus(taskRoleName, taskIndex)
 	if taskStatus.State != ci.TaskAttemptCreationRequested {
 		return false
@@ -627,7 +1690,7 @@ func (c *FrameworkController) enqueueTaskAttemptCreationTimeoutCheck(
 }
 
 func (c *FrameworkController) enqueueFrameworkRetryDelayTimeoutCheck(
-		f *ci.Framework, failIfTimeout bool) bool {
+	f *ci.Framework, failIfTimeout bool) bool {
 	if f.Status.State != ci.FrameworkAttemptCompleted {
 		return false
 	}
@@ -646,8 +1709,8 @@ func (c *FrameworkController) enqueueFrameworkRetryDelayTimeoutCheck(
 }
 
 func (c *FrameworkController) enqueueTaskRetryDelayTimeoutCheck(
-		f *ci.Framework, taskRoleName string, taskIndex int32,
-		failIfTimeout bool) bool {
+	f *ci.Framework, taskRoleName string, taskIndex int32,
+	failIfTimeout bool) bool {
 	taskStatus := f.TaskStatus(taskRoleName, taskIndex)
 	if taskStatus.State != ci.TaskAttemptCompleted {
 		return false
@@ -705,20 +1768,23 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 	// persist due to FrameworkController restart.
 	if cm == nil {
 		if f.ConfigMapUID() == nil {
-			f.TransitionFrameworkState(ci.FrameworkAttemptCreationPending)
+			if f.Status.State != ci.FrameworkAttemptCreationWaiting &&
+				f.Status.State != ci.FrameworkAttemptCreationQueuing {
+				f.TransitionFrameworkState(ci.FrameworkAttemptCreationPending)
+			}
 		} else {
 			// Avoid sync with outdated object:
 			// cm is remote creation requested but not found in the local cache.
 			if f.Status.State == ci.FrameworkAttemptCreationRequested {
 				if c.enqueueFrameworkAttemptCreationTimeoutCheck(f, true) {
 					log.Infof(logPfx +
-							"Waiting ConfigMap to appear in the local cache or timeout")
+						"Waiting ConfigMap to appear in the local cache or timeout")
 					return nil
 				}
 
 				diag := fmt.Sprintf(
 					"ConfigMap does not appear in the local cache within timeout %v, "+
-							"so consider it was deleted and force delete it",
+						"so consider it was deleted and force delete it",
 					common.SecToDuration(c.cConfig.ObjectLocalCacheCreationTimeoutSec))
 				log.Warnf(logPfx + diag)
 
@@ -730,7 +1796,7 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 				}
 
 				f.Status.AttemptStatus.CompletionStatus =
-						ci.CompletionCodeConfigMapCreationTimeout.NewCompletionStatus(diag)
+					ci.CompletionCodeConfigMapCreationTimeout.NewCompletionStatus(diag)
 			}
 
 			if f.Status.State != ci.FrameworkAttemptCompleted {
@@ -738,13 +1804,13 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 					diag := fmt.Sprintf("ConfigMap was deleted by others")
 					log.Warnf(logPfx + diag)
 					f.Status.AttemptStatus.CompletionStatus =
-							ci.CompletionCodeConfigMapExternalDeleted.NewCompletionStatus(diag)
+						ci.CompletionCodeConfigMapExternalDeleted.NewCompletionStatus(diag)
 				}
 
 				f.Status.AttemptStatus.CompletionTime = common.PtrNow()
 				f.TransitionFrameworkState(ci.FrameworkAttemptCompleted)
 				log.Infof(logPfx+
-						"FrameworkAttemptInstance %v is completed with CompletionStatus: %v",
+					"FrameworkAttemptInstance %v is completed with CompletionStatus: %v",
 					*f.FrameworkAttemptInstanceUID(),
 					f.Status.AttemptStatus.CompletionStatus)
 			}
@@ -768,12 +1834,12 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 				// The deletion requested object will never appear again with the same UID,
 				// so always just wait.
 				log.Infof(logPfx +
-						"Waiting ConfigMap to disappearing or disappear in the local cache")
+					"Waiting ConfigMap to disappearing or disappear in the local cache")
 				return nil
 			}
 
 			if f.Status.State != ci.FrameworkAttemptPreparing &&
-					f.Status.State != ci.FrameworkAttemptRunning {
+				f.Status.State != ci.FrameworkAttemptRunning {
 				f.TransitionFrameworkState(ci.FrameworkAttemptPreparing)
 			}
 		} else {
@@ -799,14 +1865,14 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 			if retryDecision.ShouldRetry {
 				// scheduleToRetryFramework
 				log.Infof(logPfx+
-						"Will retry Framework with new FrameworkAttempt: RetryDecision: %v",
+					"Will retry Framework with new FrameworkAttempt: RetryDecision: %v",
 					retryDecision)
 
 				f.Status.RetryPolicyStatus.RetryDelaySec = &retryDecision.DelaySec
 			} else {
 				// completeFramework
 				log.Infof(logPfx+
-						"Will complete Framework: RetryDecision: %v",
+					"Will complete Framework: RetryDecision: %v",
 					retryDecision)
 
 				f.Status.CompletionTime = common.PtrNow()
@@ -836,6 +1902,31 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 	}
 	// At this point, f.Status.State must be in:
 	// {FrameworkAttemptCreationPending, FrameworkAttemptPreparing,
+	// FrameworkAttemptRunning, FrameworkAttemptCreationWaiting/Queuing}
+
+	if f.Status.State == ci.FrameworkAttemptCreationQueuing {
+		if c.scheduler.checkForWaiting(f) {
+			f.TransitionFrameworkState(ci.FrameworkAttemptCreationWaiting)
+			log.Infof(logPfx+"Changing %v from Queuing to Waiting", f.Key())
+		} else {
+			c.scheduler.addToQueuing(f)
+			log.Infof(logPfx+"Add framework %v to Queuing", f.Key())
+			return nil
+		}
+	}
+
+	if f.Status.State == ci.FrameworkAttemptCreationWaiting {
+		if c.scheduler.checkForPending(f) {
+			f.TransitionFrameworkState(ci.FrameworkAttemptCreationPending)
+		} else {
+			c.scheduler.addToWaiting(f)
+			log.Infof(logPfx+"Add framework %v to Waiting", f.Key())
+			return nil
+		}
+	}
+
+	// At this point, f.Status.State must be in:
+	// {FrameworkAttemptCreationPending, FrameworkAttemptPreparing,
 	// FrameworkAttemptRunning}
 
 	if f.Status.State == ci.FrameworkAttemptCreationPending {
@@ -858,14 +1949,14 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 		// The ground truth cm is the local cached one instead of the remote one,
 		// so need to wait before continue the sync.
 		log.Infof(logPfx +
-				"Waiting ConfigMap to appear in the local cache or timeout")
+			"Waiting ConfigMap to appear in the local cache or timeout")
 		return nil
 	}
 	// At this point, f.Status.State must be in:
 	// {FrameworkAttemptPreparing, FrameworkAttemptRunning}
 
 	if f.Status.State == ci.FrameworkAttemptPreparing ||
-			f.Status.State == ci.FrameworkAttemptRunning {
+		f.Status.State == ci.FrameworkAttemptRunning {
 		cancelled, err := c.syncTaskRoleStatuses(f, cm)
 
 		if !cancelled {
@@ -880,9 +1971,155 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 	} else {
 		// Unreachable
 		panic(fmt.Errorf(logPfx+
-				"Failed: At this point, FrameworkState should be in {%v, %v} instead of %v",
+			"Failed: At this point, FrameworkState should be in {%v, %v} instead of %v",
 			ci.FrameworkAttemptPreparing, ci.FrameworkAttemptRunning, f.Status.State))
 	}
+}
+
+func (s *GlobalScheduler) getScheduleAnnotation(f *ci.Framework, key string) string {
+	if val, ok := f.Annotations["openi.cn/schedule-"+key]; ok {
+		return val
+	}
+	return ""
+}
+
+func (s *GlobalScheduler) getScheduleZoneKey(f *ci.Framework) string {
+	category := s.getScheduleAnnotation(f, "category")
+	zone := s.getScheduleAnnotation(f, "zone")
+	return fmt.Sprintf("%v:%v", category, zone)
+}
+
+func (s *GlobalScheduler) getSchedulePremotion(f *ci.Framework) int64 {
+	anno := s.getScheduleAnnotation(f, "premotion")
+	premotion, err := strconv.ParseInt(anno, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return premotion
+}
+
+func (s *GlobalScheduler) getResourceRequirements(f *ci.Framework) SkdResourceRequirements {
+	return SkdResourceRequirements{
+		Limits:   SkdResources{0, 0, 0},
+		Requests: SkdResources{0, 0, 0},
+	}
+}
+
+// Only frameworks of Queuing state will do checkForWaiting
+func (s *GlobalScheduler) checkForWaiting(f *ci.Framework) bool {
+	key := f.Key()
+	ReadLock(s.lockOfWaiting)
+	defer ReadUnlock(s.lockOfWaiting)
+	_, ok := s.fmWaiting[key]
+	return ok
+}
+
+func (s *GlobalScheduler) addToQueuing(f *ci.Framework) error {
+	key := f.Key()
+	fwk, ok := s.fmQueuing[key]
+	if !ok {
+		premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
+		queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
+		resources := s.getResourceRequirements(f)
+		fwk = &SkdFramework{
+			Key:              key,
+			QueuingTimestamp: queuingTimestamp,
+			ZoneKey:          "",
+			Zone:             nil,
+			Resources:        resources,
+		}
+		s.fmQueuing[key] = fwk
+		return nil
+	}
+	// changing of premotion while changes QueuingTimestamp
+	premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
+	queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
+	fwk.QueuingTimestamp = queuingTimestamp
+	// TODO: if resources will change ...
+	return nil
+}
+
+// Only frameworks in Waitting state will checkForPending
+func (s *GlobalScheduler) checkForPending(f *ci.Framework) bool {
+	key := f.Key()
+	ReadLock(s.lockOfPending)
+	defer ReadUnlock(s.lockOfPending)
+	_, ok := s.fmPending[key]
+	return ok
+}
+
+func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
+	key := f.Key()
+	fwk, ok := s.lookupWaitingFramework(key)
+	if !ok {
+		premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
+		queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
+		resources := s.getResourceRequirements(f)
+		fwk = &SkdFramework{
+			Key:              key,
+			QueuingTimestamp: queuingTimestamp,
+			ZoneKey:          "",
+			Zone:             nil,
+			Resources:        resources,
+		}
+		WriteLock(s.lockOfWaiting)
+		func() {
+			defer WriteUnlock(s.lockOfWaiting)
+			s.fmWaiting[key] = fwk
+		}()
+		return nil
+	}
+
+	// changing of premotion while changes QueuingTimestamp
+	premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
+	queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
+	fwk.QueuingTimestamp = queuingTimestamp
+	// TODO: if resources will change ...
+
+	// Assign framework to zone only when framework in Waiting state
+	if fwk.Zone == nil && len(fwk.ZoneKey) > 0 {
+		fwk.Zone = s.lookupZoneByKey(fwk.ZoneKey)
+	}
+	return nil
+}
+
+func (s *GlobalScheduler) lookupWaitingFramework(key string) (fwk *SkdFramework, ok bool) {
+	ReadLock(s.lockOfWaiting)
+	func() {
+		defer ReadUnlock(s.lockOfWaiting)
+		fwk, ok = s.fmWaiting[key]
+	}()
+	if ok {
+		return fwk, ok
+	}
+	s.refreshZoneList()
+	for _, skdZone := range s.zoneList {
+		ReadLock(skdZone.lockOfWaiting)
+		func() {
+			defer ReadUnlock(s.lockOfWaiting)
+			fwk, ok = skdZone.fmWaiting[key]
+		}()
+		if ok {
+			return fwk, ok
+		}
+	}
+	return fwk, ok
+}
+
+func (s *GlobalScheduler) refreshZoneList() {
+	if s.lastRefreshedZoneList.After(s.lastModifiedZone) {
+		return
+	}
+	ReadLock(s.lockOfZones)
+	func() {
+		defer ReadUnlock(s.lockOfZones)
+		list := make([]*SkdZone, 0, len(s.zones))
+		for _, skdZone := range s.zones {
+			list = append(list, skdZone)
+		}
+		s.zoneList = list
+	}()
+	s.lastRefreshedZoneList = time.Now().Add(TimeoutOfRefreshZoneList)
 }
 
 // Get Framework's current ConfigMap object, if not found, then clean up existing
@@ -892,7 +2129,7 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 // Clean up instead of recovery is because the ConfigMapUID is always the ground
 // truth.
 func (c *FrameworkController) getOrCleanupConfigMap(
-		f *ci.Framework) (*core.ConfigMap, error) {
+	f *ci.Framework) (*core.ConfigMap, error) {
 	cm, err := c.cmLister.ConfigMaps(f.Namespace).Get(f.ConfigMapName())
 	if err != nil {
 		if apiErrors.IsNotFound(err) {
@@ -915,8 +2152,8 @@ func (c *FrameworkController) getOrCleanupConfigMap(
 		} else {
 			return nil, fmt.Errorf(
 				"[%v]: ConfigMap %v naming conflicts with others: "+
-						"Existing ConfigMap %v with DeletionTimestamp %v is not "+
-						"controlled by current Framework %v, %v",
+					"Existing ConfigMap %v with DeletionTimestamp %v is not "+
+					"controlled by current Framework %v, %v",
 				f.Key(), f.ConfigMapName(),
 				cm.UID, cm.DeletionTimestamp, f.Name, f.UID)
 		}
@@ -928,7 +2165,7 @@ func (c *FrameworkController) getOrCleanupConfigMap(
 
 // Using UID to ensure we delete the right object.
 func (c *FrameworkController) deleteConfigMap(
-		f *ci.Framework, cmUID types.UID) error {
+	f *ci.Framework, cmUID types.UID) error {
 	cmName := f.ConfigMapName()
 	err := c.kClient.CoreV1().ConfigMaps(f.Namespace).Delete(cmName,
 		&meta.DeleteOptions{Preconditions: &meta.Preconditions{UID: &cmUID}})
@@ -943,7 +2180,7 @@ func (c *FrameworkController) deleteConfigMap(
 }
 
 func (c *FrameworkController) createConfigMap(
-		f *ci.Framework) (*core.ConfigMap, error) {
+	f *ci.Framework) (*core.ConfigMap, error) {
 	cm := f.NewConfigMap()
 	remoteCM, err := c.kClient.CoreV1().ConfigMaps(f.Namespace).Create(cm)
 	if err != nil {
@@ -957,7 +2194,7 @@ func (c *FrameworkController) createConfigMap(
 }
 
 func (c *FrameworkController) syncTaskRoleStatuses(
-		f *ci.Framework, cm *core.ConfigMap) (syncFrameworkCancelled bool, err error) {
+	f *ci.Framework, cm *core.ConfigMap) (syncFrameworkCancelled bool, err error) {
 	logPfx := fmt.Sprintf("[%v]: syncTaskRoleStatuses: ", f.Key())
 	log.Infof(logPfx + "Started")
 	defer func() { log.Infof(logPfx + "Completed") }()
@@ -983,7 +2220,7 @@ func (c *FrameworkController) syncTaskRoleStatuses(
 				// so in most cases, same Platform Transient Error will return.
 				log.Warnf(
 					"[%v][%v][%v]: Failed to sync Task, "+
-							"skip to sync the Tasks behind it in the TaskRole: %v",
+						"skip to sync the Tasks behind it in the TaskRole: %v",
 					f.Key(), taskRoleStatus.Name, taskStatus.Index, err)
 				break
 			}
@@ -994,8 +2231,8 @@ func (c *FrameworkController) syncTaskRoleStatuses(
 }
 
 func (c *FrameworkController) syncTaskState(
-		f *ci.Framework, cm *core.ConfigMap,
-		taskRoleName string, taskIndex int32) (syncFrameworkCancelled bool, err error) {
+	f *ci.Framework, cm *core.ConfigMap,
+	taskRoleName string, taskIndex int32) (syncFrameworkCancelled bool, err error) {
 	logPfx := fmt.Sprintf("[%v][%v][%v]: syncTaskState: ",
 		f.Key(), taskRoleName, taskIndex)
 	log.Infof(logPfx + "Started")
@@ -1034,13 +2271,13 @@ func (c *FrameworkController) syncTaskState(
 			if taskStatus.State == ci.TaskAttemptCreationRequested {
 				if c.enqueueTaskAttemptCreationTimeoutCheck(f, taskRoleName, taskIndex, true) {
 					log.Infof(logPfx +
-							"Waiting Pod to appear in the local cache or timeout")
+						"Waiting Pod to appear in the local cache or timeout")
 					return false, nil
 				}
 
 				diag := fmt.Sprintf(
 					"Pod does not appear in the local cache within timeout %v, "+
-							"so consider it was deleted and force delete it",
+						"so consider it was deleted and force delete it",
 					common.SecToDuration(c.cConfig.ObjectLocalCacheCreationTimeoutSec))
 				log.Warnf(logPfx + diag)
 
@@ -1052,7 +2289,7 @@ func (c *FrameworkController) syncTaskState(
 				}
 
 				taskStatus.AttemptStatus.CompletionStatus =
-						ci.CompletionCodePodCreationTimeout.NewCompletionStatus(diag)
+					ci.CompletionCodePodCreationTimeout.NewCompletionStatus(diag)
 			}
 
 			if taskStatus.State != ci.TaskAttemptCompleted {
@@ -1060,13 +2297,13 @@ func (c *FrameworkController) syncTaskState(
 					diag := fmt.Sprintf("Pod was deleted by others")
 					log.Warnf(logPfx + diag)
 					taskStatus.AttemptStatus.CompletionStatus =
-							ci.CompletionCodePodExternalDeleted.NewCompletionStatus(diag)
+						ci.CompletionCodePodExternalDeleted.NewCompletionStatus(diag)
 				}
 
 				taskStatus.AttemptStatus.CompletionTime = common.PtrNow()
 				f.TransitionTaskState(taskRoleName, taskIndex, ci.TaskAttemptCompleted)
 				log.Infof(logPfx+
-						"TaskAttemptInstance %v is completed with CompletionStatus: %v",
+					"TaskAttemptInstance %v is completed with CompletionStatus: %v",
 					*taskStatus.TaskAttemptInstanceUID(),
 					taskStatus.AttemptStatus.CompletionStatus)
 			}
@@ -1090,7 +2327,7 @@ func (c *FrameworkController) syncTaskState(
 				// The deletion requested object will never appear again with the same UID,
 				// so always just wait.
 				log.Infof(logPfx +
-						"Waiting Pod to disappearing or disappear in the local cache")
+					"Waiting Pod to disappearing or disappear in the local cache")
 				return false, nil
 			}
 
@@ -1102,7 +2339,7 @@ func (c *FrameworkController) syncTaskState(
 			// kills the Pod.
 			if pod.Status.Phase == core.PodUnknown {
 				log.Infof(logPfx+
-						"Waiting Pod to be deleted or deleting or transitioned from %v",
+					"Waiting Pod to be deleted or deleting or transitioned from %v",
 					pod.Status.Phase)
 				return false, nil
 			}
@@ -1143,7 +2380,7 @@ func (c *FrameworkController) syncTaskState(
 							terminated.Message))
 
 						if lastContainerExitCode == nil ||
-								lastContainerCompletionTime.Before(terminated.FinishedAt.Time) {
+							lastContainerCompletionTime.Before(terminated.FinishedAt.Time) {
 							lastContainerExitCode = &terminated.ExitCode
 							lastContainerCompletionTime = terminated.FinishedAt.Time
 						}
@@ -1153,7 +2390,7 @@ func (c *FrameworkController) syncTaskState(
 				if lastContainerExitCode == nil {
 					diag := fmt.Sprintf(
 						"Pod failed without any non-zero container exit code, maybe " +
-								"stopped by the system")
+							"stopped by the system")
 					log.Warnf(logPfx + diag)
 					c.completeTaskAttempt(f, taskRoleName, taskIndex,
 						ci.CompletionCodePodFailedWithoutFailedContainer.NewCompletionStatus(diag))
@@ -1173,7 +2410,7 @@ func (c *FrameworkController) syncTaskState(
 				return false, nil
 			} else {
 				return false, fmt.Errorf(logPfx+
-						"Failed: Got unrecognized Pod Phase: %v", pod.Status.Phase)
+					"Failed: Got unrecognized Pod Phase: %v", pod.Status.Phase)
 			}
 		} else {
 			f.TransitionTaskState(taskRoleName, taskIndex, ci.TaskAttemptDeleting)
@@ -1196,14 +2433,14 @@ func (c *FrameworkController) syncTaskState(
 			if retryDecision.ShouldRetry {
 				// scheduleToRetryTask
 				log.Infof(logPfx+
-						"Will retry Task with new TaskAttempt: RetryDecision: %v",
+					"Will retry Task with new TaskAttempt: RetryDecision: %v",
 					retryDecision)
 
 				taskStatus.RetryPolicyStatus.RetryDelaySec = &retryDecision.DelaySec
 			} else {
 				// completeTask
 				log.Infof(logPfx+
-						"Will complete Task: RetryDecision: %v",
+					"Will complete Task: RetryDecision: %v",
 					retryDecision)
 
 				taskStatus.CompletionTime = common.PtrNow()
@@ -1244,7 +2481,7 @@ func (c *FrameworkController) syncTaskState(
 			if failedTaskCount >= minFailedTaskCount {
 				diag := fmt.Sprintf(
 					"FailedTaskCount %v has reached MinFailedTaskCount %v in TaskRole [%v]: "+
-							"Triggered by Task [%v][%v]: Diagnostics: %v",
+						"Triggered by Task [%v][%v]: Diagnostics: %v",
 					failedTaskCount, minFailedTaskCount, taskRoleName,
 					taskRoleName, taskIndex, taskStatus.AttemptStatus.CompletionStatus.Diagnostics)
 				log.Infof(logPfx + diag)
@@ -1259,7 +2496,7 @@ func (c *FrameworkController) syncTaskState(
 			if succeededTaskCount >= minSucceededTaskCount {
 				diag := fmt.Sprintf(
 					"SucceededTaskCount %v has reached MinSucceededTaskCount %v in TaskRole [%v]: "+
-							"Triggered by Task [%v][%v]: Diagnostics: %v",
+						"Triggered by Task [%v][%v]: Diagnostics: %v",
 					succeededTaskCount, minSucceededTaskCount, taskRoleName,
 					taskRoleName, taskIndex, taskStatus.AttemptStatus.CompletionStatus.Diagnostics)
 				log.Infof(logPfx + diag)
@@ -1274,9 +2511,9 @@ func (c *FrameworkController) syncTaskState(
 			failedTaskCount := f.GetTaskCount((*ci.TaskStatus).IsFailed)
 			diag := fmt.Sprintf(
 				"All Tasks are completed and no user specified conditions in "+
-						"FrameworkAttemptCompletionPolicy have ever been triggered: "+
-						"TotalTaskCount: %v, FailedTaskCount: %v: "+
-						"Triggered by Task [%v][%v]: Diagnostics: %v",
+					"FrameworkAttemptCompletionPolicy have ever been triggered: "+
+					"TotalTaskCount: %v, FailedTaskCount: %v: "+
+					"Triggered by Task [%v][%v]: Diagnostics: %v",
 				totalTaskCount, failedTaskCount,
 				taskRoleName, taskIndex, taskStatus.AttemptStatus.CompletionStatus.Diagnostics)
 			log.Infof(logPfx + diag)
@@ -1301,7 +2538,7 @@ func (c *FrameworkController) syncTaskState(
 				// a TaskAttempt without an associated Pod in any case.
 				diag := fmt.Sprintf(
 					"Pod Spec is invalid in TaskRole [%v]: "+
-							"Triggered by Task [%v][%v]: Diagnostics: %v",
+						"Triggered by Task [%v][%v]: Diagnostics: %v",
 					taskRoleName, taskRoleName, taskIndex, apiErr)
 				log.Infof(logPfx + diag)
 				c.completeFrameworkAttempt(f,
@@ -1325,7 +2562,7 @@ func (c *FrameworkController) syncTaskState(
 		// The ground truth pod is the local cached one instead of the remote one,
 		// so need to wait before continue the sync.
 		log.Infof(logPfx +
-				"Waiting Pod to appear in the local cache or timeout")
+			"Waiting Pod to appear in the local cache or timeout")
 		return false, nil
 	}
 	// At this point, taskStatus.State must be in:
@@ -1333,7 +2570,7 @@ func (c *FrameworkController) syncTaskState(
 
 	// Unreachable
 	panic(fmt.Errorf(logPfx+
-			"Failed: At this point, TaskState should be in {} instead of %v",
+		"Failed: At this point, TaskState should be in {} instead of %v",
 		taskStatus.State))
 }
 
@@ -1343,8 +2580,8 @@ func (c *FrameworkController) syncTaskState(
 // writable and may be outdated even if no error.
 // Clean up instead of recovery is because the PodUID is always the ground truth.
 func (c *FrameworkController) getOrCleanupPod(
-		f *ci.Framework, cm *core.ConfigMap,
-		taskRoleName string, taskIndex int32) (*core.Pod, error) {
+	f *ci.Framework, cm *core.ConfigMap,
+	taskRoleName string, taskIndex int32) (*core.Pod, error) {
 	taskStatus := f.TaskStatus(taskRoleName, taskIndex)
 	pod, err := c.podLister.Pods(f.Namespace).Get(taskStatus.PodName())
 	if err != nil {
@@ -1367,8 +2604,8 @@ func (c *FrameworkController) getOrCleanupPod(
 		} else {
 			return nil, fmt.Errorf(
 				"[%v][%v][%v]: Pod %v naming conflicts with others: "+
-						"Existing Pod %v with DeletionTimestamp %v is not "+
-						"controlled by current ConfigMap %v, %v",
+					"Existing Pod %v with DeletionTimestamp %v is not "+
+					"controlled by current ConfigMap %v, %v",
 				f.Key(), taskRoleName, taskIndex, taskStatus.PodName(),
 				pod.UID, pod.DeletionTimestamp, cm.Name, cm.UID)
 		}
@@ -1380,8 +2617,8 @@ func (c *FrameworkController) getOrCleanupPod(
 
 // Using UID to ensure we delete the right object.
 func (c *FrameworkController) deletePod(
-		f *ci.Framework, taskRoleName string, taskIndex int32,
-		podUID types.UID) error {
+	f *ci.Framework, taskRoleName string, taskIndex int32,
+	podUID types.UID) error {
 	taskStatus := f.TaskStatus(taskRoleName, taskIndex)
 	podName := taskStatus.PodName()
 	err := c.kClient.CoreV1().Pods(f.Namespace).Delete(podName,
@@ -1397,8 +2634,8 @@ func (c *FrameworkController) deletePod(
 }
 
 func (c *FrameworkController) createPod(
-		f *ci.Framework, cm *core.ConfigMap,
-		taskRoleName string, taskIndex int32) (*core.Pod, error) {
+	f *ci.Framework, cm *core.ConfigMap,
+	taskRoleName string, taskIndex int32) (*core.Pod, error) {
 	pod := f.NewPod(cm, taskRoleName, taskIndex)
 	remotePod, err := c.kClient.CoreV1().Pods(f.Namespace).Create(pod)
 	if err != nil {
@@ -1411,8 +2648,8 @@ func (c *FrameworkController) createPod(
 }
 
 func (c *FrameworkController) completeTaskAttempt(
-		f *ci.Framework, taskRoleName string, taskIndex int32,
-		completionStatus *ci.CompletionStatus) {
+	f *ci.Framework, taskRoleName string, taskIndex int32,
+	completionStatus *ci.CompletionStatus) {
 	logPfx := fmt.Sprintf("[%v][%v][%v]: completeTaskAttempt: ",
 		f.Key(), taskRoleName, taskIndex)
 
@@ -1428,7 +2665,7 @@ func (c *FrameworkController) completeTaskAttempt(
 }
 
 func (c *FrameworkController) completeFrameworkAttempt(
-		f *ci.Framework, completionStatus *ci.CompletionStatus) {
+	f *ci.Framework, completionStatus *ci.CompletionStatus) {
 	logPfx := fmt.Sprintf("[%v]: completeFrameworkAttempt: ", f.Key())
 
 	f.Status.AttemptStatus.CompletionStatus = completionStatus
@@ -1486,7 +2723,7 @@ func (c *FrameworkController) updateRemoteFrameworkStatus(f *ci.Framework) error
 }
 
 func (c *FrameworkController) getExpectedFrameworkStatusInfo(key string) (
-		*ExpectedFrameworkStatusInfo, bool) {
+	*ExpectedFrameworkStatusInfo, bool) {
 	value, exists := c.fExpectedStatusInfos[key]
 	return value, exists
 }
@@ -1497,7 +2734,7 @@ func (c *FrameworkController) deleteExpectedFrameworkStatusInfo(key string) {
 }
 
 func (c *FrameworkController) updateExpectedFrameworkStatusInfo(key string,
-		status *ci.FrameworkStatus, remoteSynced bool) {
+	status *ci.FrameworkStatus, remoteSynced bool) {
 	log.Infof("[%v]: updateExpectedFrameworkStatusInfo", key)
 	c.fExpectedStatusInfos[key] = &ExpectedFrameworkStatusInfo{
 		status:       status,

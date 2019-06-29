@@ -104,3 +104,28 @@ func ToPod(obj interface{}) *core.Pod {
 
 	return pod
 }
+
+// obj could be *core.Node or cache.DeletedFinalStateUnknown.
+func ToNode(obj interface{}) *core.Node {
+	node, ok := obj.(*core.Node)
+
+	if !ok {
+		deletedFinalStateUnknown, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			log.Errorf(
+				"Failed to convert obj to Node or DeletedFinalStateUnknown: %#v",
+				obj)
+			return nil
+		}
+
+		node, ok = deletedFinalStateUnknown.Obj.(*core.Node)
+		if !ok {
+			log.Errorf(
+				"Failed to convert DeletedFinalStateUnknown.Obj to Node: %#v",
+				deletedFinalStateUnknown)
+			return nil
+		}
+	}
+
+	return node
+}
