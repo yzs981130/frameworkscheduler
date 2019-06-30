@@ -227,7 +227,7 @@ type SkdNode struct {
 
 type SkdPod struct {
 	Key          string
-	Framework    string
+	FrameworkKey string
 	HostIP       string
 	Node         *SkdNode
 	Phase        core.PodPhase
@@ -236,16 +236,10 @@ type SkdPod struct {
 	LastInformed time.Time
 }
 
-type SkdFrameworkSpec struct {
-	Pods map[string]*SkdPod
-}
-
-type SkdFrameworkStatus struct {
-	ZoneKey string
-}
-
 type SkdFramework struct {
 	Key              string
+	Name             string
+	Namespace        string
 	QueuingTimestamp time.Time
 	ZoneKey          string
 	Zone             *SkdZone
@@ -255,7 +249,7 @@ type SkdFramework struct {
 type SkdZone struct {
 	Key              string
 	ScheduleCategory string
-	ScnheduleZone    string
+	ScheduleZone     string
 	TotalCapacity    SkdResources
 	TotalAllocated   SkdResources
 	TotalFree        SkdResources
@@ -800,6 +794,10 @@ func (s *GlobalScheduler) addPodToNode(skdPod *SkdPod) error {
 	}()
 	// pods in node changed, notify the node
 	s.enqueueNodeKey(nodeKey)
+	// Check the framework of the pod and free resources alloced to the framework.
+	// Resources are now alloced by pods of framework.
+	// TODO: pods on multiple nodes might be of the same framework
+	s.doneForPending(skdPod.FrameworkKey)
 	return nil
 }
 
@@ -831,7 +829,7 @@ func (s *GlobalScheduler) createZone(category string, zone string) *SkdZone {
 	skdZone := &SkdZone{
 		Key:              zoneKey,
 		ScheduleCategory: category,
-		ScnheduleZone:    zone,
+		ScheduleZone:     zone,
 		TotalCapacity:    SkdResources{0, 0, 0},
 		TotalAllocated:   SkdResources{0, 0, 0},
 		TotalFree:        SkdResources{0, 0, 0},
@@ -983,11 +981,11 @@ func (s *GlobalScheduler) syncPod(key string) (returnedErr error) {
 	hostIP := pod.Status.HostIP
 	phase := pod.Status.Phase
 	skdPod = &SkdPod{
-		Key:       key,
-		Framework: frameworkKey,
-		HostIP:    hostIP,
-		Node:      nil,
-		Phase:     phase,
+		Key:          key,
+		FrameworkKey: frameworkKey,
+		HostIP:       hostIP,
+		Node:         nil,
+		Phase:        phase,
 		Resources: SkdResourceRequirements{
 			Limits:   limits,
 			Requests: requests,
@@ -1348,15 +1346,38 @@ func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
 
 	if skdZone.HasFreeResources() {
 		fwk := s.ScheduleWaitingFramework(skdZone)
-		if (fwk != nil) {
+		if fwk != nil {
 			log.Infof(logPfx+"ScheduleWaitingFramework(%v)", fwk.Key)
 			s.enqueueFrameworkKey(fwk.Key)
 		}
 	}
 
+	log.Infof("[%v] syncZone: capa=%v", key, skdZone.TotalCapacity)
+	log.Infof("[%v] syncZone: free=%v", key, skdZone.TotalFree)
+	log.Infof("[%v] syncZone: prov=%v", key, skdZone.TotalProvision)
+	log.Infof("[%v] syncZone: allc=%v", key, skdZone.TotalAllocated)
+
+	fnames := make([]string, 0, len(skdZone.fmWaiting))
+	for _, fwk := range skdZone.fmWaiting {
+		fnames = append(fnames, fwk.Name)
+	}
+
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Queuing=", key), s.fmQueuing)
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Waiting=", key), s.fmWaiting)
+	LogFrameworks(fmt.Sprintf("[%v] syncZone: Waiting=", key), skdZone.fmWaiting)
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Pending=", key), s.fmPending)
+
 	s.lastModifiedZone = time.Now()
 
 	return nil
+}
+
+func LogFrameworks(prefix string, fm map[string]*SkdFramework) {
+    fnames := make([]string, 0, len(fm))
+    for _, fwk := range fm {
+        fnames = append(fnames, fwk.Name)
+    }
+    log.Infof("%v{%v}", prefix, strings.Join(fnames, ","))
 }
 
 func (z *SkdZone) RefreshTotalCapacityAndFree() {
@@ -1384,7 +1405,6 @@ func (z *SkdZone) RefreshTotalCapacityAndFree() {
 
 	log.Infof("[%v] syncZone: nodes={%v}", z.Key, strings.Join(keys, ","))
 
-	log.Infof("[%v] syncZone: cap=%v free=%v", z.Key, totalCapacity, totalFree)
 }
 
 func (z *SkdZone) HasFreeProvision() bool {
@@ -1404,16 +1424,68 @@ func (z *SkdZone) HasFreeProvision() bool {
 
 func (z *SkdZone) HasFreeResources() bool {
 	free := z.TotalFree
-	if free.GPU < 0 {
+	allocated := z.TotalAllocated
+	if free.GPU-allocated.GPU < 0 {
 		return false
 	}
-	if free.CPU < 0 {
+	if free.CPU-allocated.CPU < 0 {
 		return false
 	}
-	if free.Memory < 0 {
+	if free.Memory-allocated.Memory < 0 {
 		return false
 	}
 	return true
+}
+
+func (z *SkdZone) ReserveResourcesForFramework(fwk *SkdFramework) {
+	provision := z.TotalProvision
+	requests := fwk.CalculateReservedResources()
+	provision.CPU += requests.CPU
+	provision.Memory += requests.Memory
+	provision.GPU += requests.GPU
+	z.TotalProvision = provision
+}
+
+func (z *SkdZone) FreeReservedResourcesOfFramework(fwk *SkdFramework) {
+	provision := z.TotalProvision
+	requests := fwk.CalculateReservedResources()
+	provision.CPU -= requests.CPU
+	provision.Memory -= requests.Memory
+	provision.GPU -= requests.GPU
+	z.TotalProvision = provision
+}
+
+func (z *SkdZone) AllocResourcesForFramework(fwk *SkdFramework) {
+	allocated := z.TotalAllocated
+	requests := fwk.CalculateReservedResources()
+	allocated.CPU += requests.CPU
+	allocated.Memory += requests.Memory
+	allocated.GPU += requests.GPU
+	z.TotalAllocated = allocated
+}
+
+func (z *SkdZone) FreeResourcesOfFramework(fwk *SkdFramework) {
+	allocated := z.TotalAllocated
+	requests := fwk.CalculateReservedResources()
+	allocated.CPU -= requests.CPU
+	allocated.Memory -= requests.Memory
+	allocated.GPU -= requests.GPU
+	z.TotalAllocated = allocated
+}
+
+func (fwk *SkdFramework) CalculateReservedResources() SkdResources {
+	requests := fwk.Resources.Requests
+	limits := fwk.Resources.Limits
+	if limits.CPU > requests.CPU {
+		requests.CPU += limits.CPU
+	}
+	if limits.Memory > requests.Memory {
+		requests.Memory += limits.Memory
+	}
+	if limits.GPU > requests.GPU {
+		requests.GPU += limits.GPU
+	}
+	return requests
 }
 
 func (s *GlobalScheduler) ScheduleWaitingForZone(skdZone *SkdZone) *SkdFramework {
@@ -1449,6 +1521,7 @@ func (s *GlobalScheduler) ScheduleWaitingToZone(fwk *SkdFramework, skdZone *SkdZ
 	func() {
 		defer WriteUnlock(skdZone.lockOfWaiting)
 		skdZone.fmWaiting[fwk.Key] = fwk
+		skdZone.ReserveResourcesForFramework(fwk)
 	}()
 }
 
@@ -1498,11 +1571,13 @@ func (s *GlobalScheduler) ScheduleWaitingFramework(skdZone *SkdZone) *SkdFramewo
 		func() {
 			defer WriteUnlock(s.lockOfPending)
 			s.fmPending[nextPending.Key] = nextPending
+			skdZone.AllocResourcesForFramework(nextPending)
 		}()
 		WriteLock(skdZone.lockOfWaiting)
 		func() {
 			defer WriteUnlock(skdZone.lockOfWaiting)
 			delete(skdZone.fmWaiting, nextPending.Key)
+			skdZone.FreeReservedResourcesOfFramework(nextPending)
 		}()
 	}
 	return nextPending
@@ -1983,12 +2058,6 @@ func (s *GlobalScheduler) getScheduleAnnotation(f *ci.Framework, key string) str
 	return ""
 }
 
-func (s *GlobalScheduler) getScheduleZoneKey(f *ci.Framework) string {
-	category := s.getScheduleAnnotation(f, "category")
-	zone := s.getScheduleAnnotation(f, "zone")
-	return fmt.Sprintf("%v:%v", category, zone)
-}
-
 func (s *GlobalScheduler) getSchedulePremotion(f *ci.Framework) int64 {
 	anno := s.getScheduleAnnotation(f, "premotion")
 	premotion, err := strconv.ParseInt(anno, 10, 64)
@@ -1998,11 +2067,38 @@ func (s *GlobalScheduler) getSchedulePremotion(f *ci.Framework) int64 {
 	return premotion
 }
 
-func (s *GlobalScheduler) getResourceRequirements(f *ci.Framework) SkdResourceRequirements {
-	return SkdResourceRequirements{
+func (s *GlobalScheduler) GetResourceRequirements(f *ci.Framework) SkdResourceRequirements {
+	resources := SkdResourceRequirements{
 		Limits:   SkdResources{0, 0, 0},
 		Requests: SkdResources{0, 0, 0},
 	}
+	for _, taskRole := range f.Spec.TaskRoles {
+		tn := int64(taskRole.TaskNumber)
+		pod := taskRole.Task.Pod
+		containers := append(pod.Spec.InitContainers, pod.Spec.Containers...)
+		for _, container := range containers {
+			lcpu := GetCPUQuantity(container.Resources.Limits)
+			lmemory := GetMemoryQuantity(container.Resources.Limits)
+			lgpu := GetGPUQuantity(container.Resources.Limits)
+			rcpu := GetCPUQuantity(container.Resources.Requests)
+			rmemory := GetMemoryQuantity(container.Resources.Requests)
+			rgpu := GetGPUQuantity(container.Resources.Requests)
+			// We assume best effort pod holding 1000MHz CPU and 512MB Memory
+			if lcpu == 0 && rcpu == 0 {
+				lcpu = 1000
+			}
+			if lmemory == 0 && rmemory == 0 {
+				lmemory = 512
+			}
+			resources.Limits.CPU += lcpu * tn
+			resources.Limits.Memory += lmemory * tn
+			resources.Limits.GPU += lgpu * tn
+			resources.Requests.CPU += rcpu * tn
+			resources.Requests.Memory += rmemory * tn
+			resources.Requests.GPU += rgpu * tn
+		}
+	}
+	return resources
 }
 
 // Only frameworks of Queuing state will do checkForWaiting
@@ -2020,9 +2116,11 @@ func (s *GlobalScheduler) addToQueuing(f *ci.Framework) error {
 	if !ok {
 		premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
 		queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
-		resources := s.getResourceRequirements(f)
+		resources := s.GetResourceRequirements(f)
 		fwk = &SkdFramework{
 			Key:              key,
+			Name:             f.Name,
+			Namespace:        f.Namespace,
 			QueuingTimestamp: queuingTimestamp,
 			ZoneKey:          "",
 			Zone:             nil,
@@ -2048,15 +2146,27 @@ func (s *GlobalScheduler) checkForPending(f *ci.Framework) bool {
 	return ok
 }
 
+// Frameworks in Pending state will be removed from fmPending
+func (s *GlobalScheduler) doneForPending(key string) {
+	WriteLock(s.lockOfPending)
+	defer WriteUnlock(s.lockOfPending)
+	if fwk, ok := s.fmPending[key]; ok {
+		fwk.Zone.FreeResourcesOfFramework(fwk)
+		delete(s.fmPending, key)
+	}
+}
+
 func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
 	key := f.Key()
 	fwk, ok := s.lookupWaitingFramework(key)
 	if !ok {
 		premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
 		queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
-		resources := s.getResourceRequirements(f)
+		resources := s.GetResourceRequirements(f)
 		fwk = &SkdFramework{
 			Key:              key,
+			Name:             f.Name,
+			Namespace:        f.Namespace,
 			QueuingTimestamp: queuingTimestamp,
 			ZoneKey:          "",
 			Zone:             nil,
@@ -2079,8 +2189,23 @@ func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
 	// Assign framework to zone only when framework in Waiting state
 	if fwk.Zone == nil && len(fwk.ZoneKey) > 0 {
 		fwk.Zone = s.lookupZoneByKey(fwk.ZoneKey)
+		if fwk.Zone != nil {
+			s.bindFrameworkToZone(f, fwk.Zone)
+		} else {
+			// Unreachable
+			log.Warnf("s.lookupZoneByKey(%v) return nil", fwk.ZoneKey)
+		}
+		s.enqueueZoneKey(fwk.ZoneKey)
 	}
 	return nil
+}
+
+func (s *GlobalScheduler) bindFrameworkToZone(f *ci.Framework, skdZone *SkdZone) {
+	// f.Annotations[AnnotationKeyScheduleCategory] == skdZone.ScheduleCategory
+	if f.Annotations == nil {
+		f.Annotations = make(map[string]string)
+	}
+	f.Annotations[AnnotationKeyScheduleZone] = skdZone.ScheduleZone
 }
 
 func (s *GlobalScheduler) lookupWaitingFramework(key string) (fwk *SkdFramework, ok bool) {
