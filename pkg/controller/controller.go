@@ -51,6 +51,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"sort"
 )
 
 // FrameworkController maintains the lifecycle for all Frameworks in the cluster.
@@ -244,6 +245,7 @@ type SkdFramework struct {
 	ZoneKey          string
 	Zone             *SkdZone
 	Resources        SkdResourceRequirements
+	LastSync         time.Time
 }
 
 type SkdZone struct {
@@ -267,6 +269,7 @@ type GlobalScheduler struct {
 	fmPending map[string]*SkdFramework
 
 	podLister    coreLister.PodLister
+	fLister      frameworkLister.FrameworkLister
 	nodeInformer cache.SharedIndexInformer
 	nodeLister   coreLister.NodeLister
 	fQueue       workqueue.RateLimitingInterface
@@ -301,12 +304,13 @@ const (
 
 	AnnotationKeyScheduleCategory  string = "openi.cn/schedule-category"
 	AnnotationKeyScheduleZone      string = "openi.cn/schedule-zone"
-	AnnotationKeySchedulePremotion string = "openi.cn/schedule-premotion"
+	AnnotationKeySchedulePreemption string = "openi.cn/schedule-preemption"
 
 	LabelKeyScheduleCategory string = AnnotationKeyScheduleCategory
 	LabelKeyScheduleZone     string = AnnotationKeyScheduleZone
 
 	TimeoutOfRefreshZoneList time.Duration = 100 * time.Millisecond
+	TimeoutOfFrameworkSync   time.Duration = 10 * time.Second
 )
 
 func NewFrameworkController() *FrameworkController {
@@ -349,6 +353,7 @@ func NewFrameworkController() *FrameworkController {
 		fmPending: make(map[string]*SkdFramework),
 
 		podLister:    podLister,
+		fLister:      fLister,
 		nodeInformer: nodeInformer,
 		nodeLister:   nodeLister,
 		fQueue:       fQueue,
@@ -1339,6 +1344,7 @@ func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
 			fwk = s.ScheduleQueuingFramework()
 			if fwk != nil {
 				log.Infof(logPfx+"ScheduleQueuingFramework(%v)", fwk.Key)
+				fwk.ZoneKey = skdZone.Key
 				s.enqueueFrameworkKey(fwk.Key)
 			}
 		}
@@ -1362,22 +1368,28 @@ func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
 		fnames = append(fnames, fwk.Name)
 	}
 
-	LogFrameworks(fmt.Sprintf("[%v] schedule: Queuing=", key), s.fmQueuing)
-	LogFrameworks(fmt.Sprintf("[%v] schedule: Waiting=", key), s.fmWaiting)
-	LogFrameworks(fmt.Sprintf("[%v] syncZone: Waiting=", key), skdZone.fmWaiting)
-	LogFrameworks(fmt.Sprintf("[%v] schedule: Pending=", key), s.fmPending)
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Queuing=", key), s.fmQueuing, s.lockOfQueuing)
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Waiting=", key), s.fmWaiting, s.lockOfWaiting)
+	LogFrameworks(fmt.Sprintf("[%v] syncZone: Waiting=", key), skdZone.fmWaiting, skdZone.lockOfWaiting)
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Pending=", key), s.fmPending, s.lockOfPending)
 
 	s.lastModifiedZone = time.Now()
 
 	return nil
 }
 
-func LogFrameworks(prefix string, fm map[string]*SkdFramework) {
-    fnames := make([]string, 0, len(fm))
-    for _, fwk := range fm {
-        fnames = append(fnames, fwk.Name)
-    }
-    log.Infof("%v{%v}", prefix, strings.Join(fnames, ","))
+func LogFrameworks(prefix string, fm map[string]*SkdFramework, lock *sync.RWMutex) {
+	var fnames sort.StringSlice = nil
+	ReadLock(lock)
+	func() {
+		defer ReadUnlock(lock)
+		fnames = make(sort.StringSlice, 0, len(fm))
+		for _, fwk := range fm {
+			fnames = append(fnames, fwk.Name)
+		}
+	}()
+	fnames.Sort()
+	log.Infof("%v{%v}", prefix, strings.Join(fnames, ","))
 }
 
 func (z *SkdZone) RefreshTotalCapacityAndFree() {
@@ -1525,47 +1537,119 @@ func (s *GlobalScheduler) ScheduleWaitingToZone(fwk *SkdFramework, skdZone *SkdZ
 	}()
 }
 
+func (s *GlobalScheduler) AddFrameworkToQueuing(fwk *SkdFramework) {
+	WriteLock(s.lockOfQueuing)
+	defer WriteUnlock(s.lockOfQueuing)
+	s.fmWaiting[fwk.Key] = fwk
+}
+
+func (s *GlobalScheduler) DeleteFrameworkFromQueuing(key string) {
+	WriteLock(s.lockOfQueuing)
+	defer WriteUnlock(s.lockOfQueuing)
+	delete(s.fmQueuing, key)
+}
+
+func (s *GlobalScheduler) AddFrameworkToWaiting(fwk *SkdFramework) {
+	WriteLock(s.lockOfWaiting)
+	defer WriteUnlock(s.lockOfWaiting)
+	s.fmWaiting[fwk.Key] = fwk
+}
+
+func (s *GlobalScheduler) DeleteFrameworkFromWaiting(key string) {
+	WriteLock(s.lockOfWaiting)
+	defer WriteUnlock(s.lockOfWaiting)
+	delete(s.fmWaiting, key)
+}
+
+func (z *SkdZone) AddFrameworkToWaiting(fwk *SkdFramework) {
+	WriteLock(z.lockOfWaiting)
+	defer WriteUnlock(z.lockOfWaiting)
+	z.fmWaiting[fwk.Key] = fwk
+}
+
+func (z *SkdZone) DeleteFrameworkFromWaiting(key string) {
+	WriteLock(z.lockOfWaiting)
+	defer WriteUnlock(z.lockOfWaiting)
+	delete(z.fmWaiting, key)
+}
+
 func (s *GlobalScheduler) ScheduleQueuingFramework() *SkdFramework {
 	var nextWaiting *SkdFramework = nil
+	fwks := make([]*SkdFramework, 0)
 	ReadLock(s.lockOfQueuing)
 	func() {
 		defer ReadUnlock(s.lockOfQueuing)
 		for _, fwk := range s.fmQueuing {
-			if nextWaiting == nil {
-				nextWaiting = fwk
-			} else if fwk.QueuingTimestamp.Before(nextWaiting.QueuingTimestamp) {
-				nextWaiting = fwk
-			}
+			fwks = append(fwks, fwk)
 		}
 	}()
+	now := time.Now()
+	for _, fwk := range fwks {
+		if now.Sub(fwk.LastSync) > TimeoutOfFrameworkSync {
+			f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
+			if err != nil {
+				if apiErrors.IsNotFound(err) {
+					// framework does not exist, delete it from fmQueuing
+					s.DeleteFrameworkFromQueuing(fwk.Key)
+				}
+				continue
+			} else if f.DeletionTimestamp != nil {
+				// framework is being deleted, so delete it from fmQueuing
+				s.DeleteFrameworkFromQueuing(fwk.Key)
+				continue
+			}
+			fwk.QueuingTimestamp = GetQueuingTimestamp(f)
+			fwk.LastSync = now
+			log.Infof("SQueuing: Sync %v - %v", fwk.Key, fwk.QueuingTimestamp)
+		}
+		if nextWaiting == nil {
+			nextWaiting = fwk
+		}
+		if fwk.QueuingTimestamp.Before(nextWaiting.QueuingTimestamp) {
+			nextWaiting = fwk
+		}
+	}
 	if nextWaiting != nil {
-		WriteLock(s.lockOfWaiting)
-		func() {
-			defer WriteUnlock(s.lockOfWaiting)
-			s.fmWaiting[nextWaiting.Key] = nextWaiting
-		}()
-		WriteLock(s.lockOfQueuing)
-		func() {
-			defer WriteUnlock(s.lockOfQueuing)
-			delete(s.fmQueuing, nextWaiting.Key)
-		}()
+		s.AddFrameworkToWaiting(nextWaiting)
+		s.DeleteFrameworkFromQueuing(nextWaiting.Key)
 	}
 	return nextWaiting
 }
 
 func (s *GlobalScheduler) ScheduleWaitingFramework(skdZone *SkdZone) *SkdFramework {
 	var nextPending *SkdFramework = nil
+	fwks := make([]*SkdFramework, 0)
 	ReadLock(skdZone.lockOfWaiting)
 	func() {
 		defer ReadUnlock(skdZone.lockOfWaiting)
 		for _, fwk := range skdZone.fmWaiting {
-			if nextPending == nil {
-				nextPending = fwk
-			} else if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
-				nextPending = fwk
-			}
+			fwks = append(fwks, fwk)
 		}
 	}()
+	now := time.Now()
+	for _, fwk := range fwks {
+		if now.Sub(fwk.LastSync) > TimeoutOfFrameworkSync {
+			f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
+			if err != nil {
+				if apiErrors.IsNotFound(err) {
+					// framework does not exist, delete it from fmQueuing
+					skdZone.DeleteFrameworkFromWaiting(fwk.Key)
+				}
+				continue
+			} else if f.DeletionTimestamp != nil {
+				// framework is being deleted, so delete it from fmQueuing
+				skdZone.DeleteFrameworkFromWaiting(fwk.Key)
+			}
+			fwk.QueuingTimestamp = GetQueuingTimestamp(f)
+			fwk.LastSync = now
+			log.Infof("SWaiting: Sync %v - %v", fwk.Key, fwk.QueuingTimestamp)
+		}
+		if nextPending == nil {
+			nextPending = fwk
+		} else if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
+			nextPending = fwk
+		}
+	}
 	if nextPending != nil {
 		WriteLock(s.lockOfPending)
 		func() {
@@ -1986,6 +2070,7 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 		} else {
 			c.scheduler.addToQueuing(f)
 			log.Infof(logPfx+"Add framework %v to Queuing", f.Key())
+			c.scheduler.enqueueZonesForQueuing()
 			return nil
 		}
 	}
@@ -1996,6 +2081,7 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 		} else {
 			c.scheduler.addToWaiting(f)
 			log.Infof(logPfx+"Add framework %v to Waiting", f.Key())
+			c.scheduler.enqueueZonesForWaiting()
 			return nil
 		}
 	}
@@ -2051,20 +2137,20 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 	}
 }
 
-func (s *GlobalScheduler) getScheduleAnnotation(f *ci.Framework, key string) string {
-	if val, ok := f.Annotations["openi.cn/schedule-"+key]; ok {
+func GetScheduleAnnotation(f *ci.Framework, key string) string {
+	if val, ok := f.Annotations[key]; ok {
 		return val
 	}
 	return ""
 }
 
-func (s *GlobalScheduler) getSchedulePremotion(f *ci.Framework) int64 {
-	anno := s.getScheduleAnnotation(f, "premotion")
-	premotion, err := strconv.ParseInt(anno, 10, 64)
+func GetSchedulePreemption(f *ci.Framework) int64 {
+	anno := GetScheduleAnnotation(f, AnnotationKeySchedulePreemption)
+	preemption, err := strconv.ParseInt(anno, 10, 64)
 	if err != nil {
 		return 0
 	}
-	return premotion
+	return preemption
 }
 
 func (s *GlobalScheduler) GetResourceRequirements(f *ci.Framework) SkdResourceRequirements {
@@ -2110,12 +2196,17 @@ func (s *GlobalScheduler) checkForWaiting(f *ci.Framework) bool {
 	return ok
 }
 
+func GetQueuingTimestamp(f *ci.Framework) time.Time {
+	preemption := time.Duration(GetSchedulePreemption(f)) * time.Second
+	queuingTimestamp := f.CreationTimestamp.Time.Add(-preemption)
+	return queuingTimestamp
+}
+
 func (s *GlobalScheduler) addToQueuing(f *ci.Framework) error {
 	key := f.Key()
 	fwk, ok := s.fmQueuing[key]
 	if !ok {
-		premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
-		queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
+		queuingTimestamp := GetQueuingTimestamp(f)
 		resources := s.GetResourceRequirements(f)
 		fwk = &SkdFramework{
 			Key:              key,
@@ -2125,14 +2216,13 @@ func (s *GlobalScheduler) addToQueuing(f *ci.Framework) error {
 			ZoneKey:          "",
 			Zone:             nil,
 			Resources:        resources,
+			LastSync:         time.Now(),
 		}
 		s.fmQueuing[key] = fwk
 		return nil
 	}
-	// changing of premotion while changes QueuingTimestamp
-	premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
-	queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
-	fwk.QueuingTimestamp = queuingTimestamp
+	// changing of preemption while changes QueuingTimestamp
+	fwk.QueuingTimestamp = GetQueuingTimestamp(f)
 	// TODO: if resources will change ...
 	return nil
 }
@@ -2160,8 +2250,7 @@ func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
 	key := f.Key()
 	fwk, ok := s.lookupWaitingFramework(key)
 	if !ok {
-		premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
-		queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
+		queuingTimestamp := GetQueuingTimestamp(f)
 		resources := s.GetResourceRequirements(f)
 		fwk = &SkdFramework{
 			Key:              key,
@@ -2171,19 +2260,14 @@ func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
 			ZoneKey:          "",
 			Zone:             nil,
 			Resources:        resources,
+			LastSync:         time.Now(),
 		}
-		WriteLock(s.lockOfWaiting)
-		func() {
-			defer WriteUnlock(s.lockOfWaiting)
-			s.fmWaiting[key] = fwk
-		}()
+		s.AddFrameworkToWaiting(fwk)
 		return nil
 	}
 
-	// changing of premotion while changes QueuingTimestamp
-	premotion := time.Duration(s.getSchedulePremotion(f)) * time.Second
-	queuingTimestamp := f.CreationTimestamp.Time.Add(-premotion)
-	fwk.QueuingTimestamp = queuingTimestamp
+	// changing of preemption while changes QueuingTimestamp
+	fwk.QueuingTimestamp = GetQueuingTimestamp(f)
 	// TODO: if resources will change ...
 
 	// Assign framework to zone only when framework in Waiting state
@@ -2198,6 +2282,24 @@ func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
 		s.enqueueZoneKey(fwk.ZoneKey)
 	}
 	return nil
+}
+
+func (s *GlobalScheduler) enqueueZonesForQueuing() {
+	zoneList := s.RefreshZoneList()
+	for _, skdZone := range zoneList {
+		if skdZone.HasFreeProvision() {
+			s.enqueueZoneKey(skdZone.Key)
+		}
+	}
+}
+
+func (s *GlobalScheduler) enqueueZonesForWaiting() {
+	zoneList := s.RefreshZoneList()
+	for _, skdZone := range zoneList {
+		if skdZone.HasFreeResources() {
+			s.enqueueZoneKey(skdZone.Key)
+		}
+	}
 }
 
 func (s *GlobalScheduler) bindFrameworkToZone(f *ci.Framework, skdZone *SkdZone) {
@@ -2217,11 +2319,11 @@ func (s *GlobalScheduler) lookupWaitingFramework(key string) (fwk *SkdFramework,
 	if ok {
 		return fwk, ok
 	}
-	s.refreshZoneList()
-	for _, skdZone := range s.zoneList {
+	zoneList := s.RefreshZoneList()
+	for _, skdZone := range zoneList {
 		ReadLock(skdZone.lockOfWaiting)
 		func() {
-			defer ReadUnlock(s.lockOfWaiting)
+			defer ReadUnlock(skdZone.lockOfWaiting)
 			fwk, ok = skdZone.fmWaiting[key]
 		}()
 		if ok {
@@ -2231,9 +2333,9 @@ func (s *GlobalScheduler) lookupWaitingFramework(key string) (fwk *SkdFramework,
 	return fwk, ok
 }
 
-func (s *GlobalScheduler) refreshZoneList() {
+func (s *GlobalScheduler) RefreshZoneList() []*SkdZone {
 	if s.lastRefreshedZoneList.After(s.lastModifiedZone) {
-		return
+		return s.zoneList
 	}
 	ReadLock(s.lockOfZones)
 	func() {
@@ -2245,6 +2347,7 @@ func (s *GlobalScheduler) refreshZoneList() {
 		s.zoneList = list
 	}()
 	s.lastRefreshedZoneList = time.Now().Add(TimeoutOfRefreshZoneList)
+	return s.zoneList
 }
 
 // Get Framework's current ConfigMap object, if not found, then clean up existing
@@ -2856,6 +2959,10 @@ func (c *FrameworkController) getExpectedFrameworkStatusInfo(key string) (
 func (c *FrameworkController) deleteExpectedFrameworkStatusInfo(key string) {
 	log.Infof("[%v]: deleteExpectedFrameworkStatusInfo: ", key)
 	delete(c.fExpectedStatusInfos, key)
+	// Cleanup Queuing, Waiting, and Pending framework in scheduler
+	c.scheduler.DeleteFrameworkFromQueuing(key)
+	c.scheduler.DeleteFrameworkFromWaiting(key)
+	c.scheduler.doneForPending(key)
 }
 
 func (c *FrameworkController) updateExpectedFrameworkStatusInfo(key string,
