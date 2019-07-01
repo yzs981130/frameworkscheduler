@@ -985,8 +985,8 @@ func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
 		} else {
 			fwk = s.ScheduleQueuingFramework(skdZone.ScheduleCategory)
 			if fwk != nil {
-				log.Infof(logPfx+"ScheduleQueuingFramework: %v -> %v", 
-											fwk.Key, skdZone.ScheduleCategory)
+				log.Infof(logPfx+"ScheduleQueuingFramework: %v -> %v",
+					fwk.Key, skdZone.ScheduleCategory)
 				fwk.ZoneKey = skdZone.Key
 				s.enqueueFrameworkKey(fwk.Key)
 			}
@@ -1212,6 +1212,26 @@ func TestScheduleCategory(fwkCategory, category string) bool {
 	return false
 }
 
+func (s *GlobalScheduler) ResyncFrameworkWithCache(fwk *SkdFramework) bool {
+	if now.Sub(fwk.LastSync) > ci.TimeoutOfFrameworkSync {
+		f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
+		if err != nil {
+			if apiErrors.IsNotFound(err) {
+				// framework does not exist, should delete it
+				return false
+			}
+			return true
+		} else if f.DeletionTimestamp != nil {
+			// framework is being deleted, so it should be deleted
+			return false
+		}
+		fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
+		fwk.LastSync = now
+		//log.Infof("SQueuing: Sync %v - %v", fwk.Key, fwk.QueuingTimestamp)
+	}
+	return true
+}
+
 func (s *GlobalScheduler) ScheduleQueuingFramework(scheduleCategory string) *SkdFramework {
 	var nextWaiting *SkdFramework = nil
 	fwks := make([]*SkdFramework, 0)
@@ -1224,31 +1244,17 @@ func (s *GlobalScheduler) ScheduleQueuingFramework(scheduleCategory string) *Skd
 	}()
 	now := time.Now()
 	for _, fwk := range fwks {
-		if !TestScheduleCategory(fwk.ScheduleCategory, scheduleCategory) {
-			continue
-		}
-		if now.Sub(fwk.LastSync) > ci.TimeoutOfFrameworkSync {
-			f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
-			if err != nil {
-				if apiErrors.IsNotFound(err) {
-					// framework does not exist, delete it from fmQueuing
-					s.DeleteFrameworkFromQueuing(fwk.Key)
+		if ResyncFrameworkWithCache(fwk) {
+			if TestScheduleCategory(fwk.ScheduleCategory, scheduleCategory) {
+				if nextWaiting == nil {
+					nextWaiting = fwk
 				}
-				continue
-			} else if f.DeletionTimestamp != nil {
-				// framework is being deleted, so delete it from fmQueuing
-				s.DeleteFrameworkFromQueuing(fwk.Key)
-				continue
+				if fwk.QueuingTimestamp.Before(nextWaiting.QueuingTimestamp) {
+					nextWaiting = fwk
+				}
 			}
-			fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
-			fwk.LastSync = now
-			log.Infof("SQueuing: Sync %v - %v", fwk.Key, fwk.QueuingTimestamp)
-		}
-		if nextWaiting == nil {
-			nextWaiting = fwk
-		}
-		if fwk.QueuingTimestamp.Before(nextWaiting.QueuingTimestamp) {
-			nextWaiting = fwk
+		} else {
+			s.DeleteFrameworkFromQueuing(fwk.Key)
 		}
 	}
 	if nextWaiting != nil {
@@ -1270,26 +1276,14 @@ func (s *GlobalScheduler) ScheduleWaitingFramework(skdZone *SkdZone) *SkdFramewo
 	}()
 	now := time.Now()
 	for _, fwk := range fwks {
-		if now.Sub(fwk.LastSync) > ci.TimeoutOfFrameworkSync {
-			f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
-			if err != nil {
-				if apiErrors.IsNotFound(err) {
-					// framework does not exist, delete it from fmQueuing
-					skdZone.DeleteFrameworkFromWaiting(fwk.Key)
-				}
-				continue
-			} else if f.DeletionTimestamp != nil {
-				// framework is being deleted, so delete it from fmQueuing
-				skdZone.DeleteFrameworkFromWaiting(fwk.Key)
+		if s.ResyncFrameworkWithCache(fwk) {
+			if nextPending == nil {
+				nextPending = fwk
+			} else if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
+				nextPending = fwk
 			}
-			fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
-			fwk.LastSync = now
-			log.Infof("SWaiting: Sync %v - %v", fwk.Key, fwk.QueuingTimestamp)
-		}
-		if nextPending == nil {
-			nextPending = fwk
-		} else if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
-			nextPending = fwk
+		} else {
+			skdZone.DeleteFrameworkFromWaiting(fwk.Key)
 		}
 	}
 	if nextPending != nil {
@@ -1544,4 +1538,3 @@ func (s *GlobalScheduler) RefreshZoneList() []*SkdZone {
 	s.lastRefreshedZoneList = time.Now().Add(ci.TimeoutOfRefreshZoneList)
 	return s.zoneList
 }
-
