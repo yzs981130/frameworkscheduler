@@ -991,6 +991,8 @@ func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
 				s.enqueueFrameworkKey(fwk.Key)
 			}
 		}
+	} else {
+		//fwk := s.ScheduleRemotableFramework(skdZone.ScheduleCategory)
 	}
 
 	if skdZone.HasFreeResources() {
@@ -1212,7 +1214,8 @@ func TestScheduleCategory(fwkCategory, category string) bool {
 	return false
 }
 
-func (s *GlobalScheduler) ResyncFrameworkWithCache(fwk *SkdFramework) bool {
+func (s *GlobalScheduler) ResyncFrameworkQueuingTimestamp(fwk *SkdFramework) bool {
+	now := time.Now()
 	if now.Sub(fwk.LastSync) > ci.TimeoutOfFrameworkSync {
 		f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
 		if err != nil {
@@ -1242,9 +1245,8 @@ func (s *GlobalScheduler) ScheduleQueuingFramework(scheduleCategory string) *Skd
 			fwks = append(fwks, fwk)
 		}
 	}()
-	now := time.Now()
 	for _, fwk := range fwks {
-		if ResyncFrameworkWithCache(fwk) {
+		if s.ResyncFrameworkQueuingTimestamp(fwk) {
 			if TestScheduleCategory(fwk.ScheduleCategory, scheduleCategory) {
 				if nextWaiting == nil {
 					nextWaiting = fwk
@@ -1274,9 +1276,8 @@ func (s *GlobalScheduler) ScheduleWaitingFramework(skdZone *SkdZone) *SkdFramewo
 			fwks = append(fwks, fwk)
 		}
 	}()
-	now := time.Now()
 	for _, fwk := range fwks {
-		if s.ResyncFrameworkWithCache(fwk) {
+		if s.ResyncFrameworkQueuingTimestamp(fwk) {
 			if nextPending == nil {
 				nextPending = fwk
 			} else if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
@@ -1409,6 +1410,7 @@ func (s *GlobalScheduler) addToQueuing(f *ci.Framework) bool {
 	}
 	// changing of preemption while changes QueuingTimestamp
 	fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
+	fwk.LastSync = time.Now()
 	// TODO: if resources will change ...
 	return false
 }
@@ -1443,6 +1445,7 @@ func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
 
 	// changing of preemption while changes QueuingTimestamp
 	fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
+	fwk.LastSync = time.Now()
 	// TODO: if resources will change ...
 
 	// Assign framework to zone only when framework in Waiting state
