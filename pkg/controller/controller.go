@@ -47,11 +47,11 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"sort"
 )
 
 // FrameworkController maintains the lifecycle for all Frameworks in the cluster.
@@ -302,8 +302,8 @@ const (
 	DefaultScheduleZone     string = "default"
 	DefaultZoneKey          string = "default/default"
 
-	AnnotationKeyScheduleCategory  string = "openi.cn/schedule-category"
-	AnnotationKeyScheduleZone      string = "openi.cn/schedule-zone"
+	AnnotationKeyScheduleCategory   string = "openi.cn/schedule-category"
+	AnnotationKeyScheduleZone       string = "openi.cn/schedule-zone"
 	AnnotationKeySchedulePreemption string = "openi.cn/schedule-preemption"
 
 	LabelKeyScheduleCategory string = AnnotationKeyScheduleCategory
@@ -312,6 +312,123 @@ const (
 	TimeoutOfRefreshZoneList time.Duration = 100 * time.Millisecond
 	TimeoutOfFrameworkSync   time.Duration = 10 * time.Second
 )
+
+type InterdomScheduler struct {
+	mapfcs       map[string]*FrameworkController
+	myfc         *FrameworkController
+	fRemoteQueue workqueue.RateLimitingInterface
+}
+
+func NewInterdomScheduler(myfc *FrameworkController) *InterdomScheduler {
+	fRemoteQueue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
+	is := &InterdomScheduler{
+		mapfcs:       make(map[string]*FrameworkController),
+		myfc:         myfc,
+		fRemoteQueue: fRemoteQueue,
+	}
+	cConfigs := ci.NewRemoteConfigs()
+	for _, cConfig := range cConfigs {
+		kConfig := ci.BuildKubeConfig(cConfig)
+		host := kConfig.Host
+		if _, ok := is.mapfcs[host]; ok {
+			common.LogLines("Duplicated host: %v", host)
+			continue
+		}
+		kClient, fClient := util.CreateClients(kConfig)
+		fListerInformer := frameworkInformer.NewSharedInformerFactory(fClient,
+			0).Frameworkcontroller().V1().Frameworks()
+		fInformer := fListerInformer.Informer()
+		fLister := fListerInformer.Lister()
+		fc := &FrameworkController{
+			kConfig:   kConfig,
+			cConfig:   cConfig,
+			kClient:   kClient,
+			fClient:   fClient,
+			fInformer: fInformer,
+			fLister:   fLister,
+		}
+		fInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				is.onRemoveFrameworkAdd(obj, fc)
+			},
+			UpdateFunc: func(oldObj, newObj interface{}) {
+				is.onRemoveFrameworkUpdate(newObj, fc)
+			},
+			DeleteFunc: func(obj interface{}) {
+				is.onRemoveFrameworkDelete(obj, fc)
+			},
+		})
+		is.mapfcs[host] = fc
+	}
+	return is
+}
+
+func GetFrameworkKey(obj interface{}) string {
+	key, err := util.GetKey(obj)
+	if err != nil {
+		log.Errorf("Failed to get key for obj %#v, skip to enqueue: %v", obj, err)
+		return ""
+	}
+
+	_, _, err = util.SplitKey(key)
+	if err != nil {
+		log.Errorf("Got invalid key %v for obj %#v, skip to enqueue: %v", key, obj, err)
+		return ""
+	}
+
+	return key
+}
+
+func (is *InterdomScheduler) onRemoveFrameworkAdd(obj interface{}, fc *FrameworkController) {
+	key := GetFrameworkKey(obj)
+	log.Infof("[%v] onRemoveFrameworkAdd: %v", key, fc.kConfig.Host)
+}
+
+func (is *InterdomScheduler) onRemoveFrameworkUpdate(obj interface{}, fc *FrameworkController) {
+	key := GetFrameworkKey(obj)
+	log.Infof("[%v] onRemoveFrameworkUpdate: %v", key, fc.kConfig.Host)
+}
+
+func (is *InterdomScheduler) onRemoveFrameworkDelete(obj interface{}, fc *FrameworkController) {
+	key := GetFrameworkKey(obj)
+	log.Infof("[%v] onRemoveFrameworkDelete: %v", key, fc.kConfig.Host)
+}
+
+func (is *InterdomScheduler) worker(fc *FrameworkController, id int32) {
+}
+
+func (is *InterdomScheduler) Run(stopCh <-chan struct{}) {
+	defer is.fRemoteQueue.ShutDown()
+	defer log.Errorf("InterdomScheduler Stopping " + ci.ComponentName)
+	defer runtime.HandleCrash()
+
+	for _, fc := range is.mapfcs {
+		log.Infof("InterdomScheduler Recovering " + fc.kConfig.Host)
+		util.PutCRD(
+			fc.kConfig,
+			ci.BuildFrameworkCRD(),
+			fc.cConfig.CRDEstablishedCheckIntervalSec,
+			fc.cConfig.CRDEstablishedCheckTimeoutSec)
+
+		go fc.fInformer.Run(stopCh)
+		if !cache.WaitForCacheSync(
+			stopCh,
+			fc.fInformer.HasSynced) {
+			log.Errorf("Failed to WaitForCacheSync for %v", fc.kConfig.Host)
+		}
+
+		log.Infof("Running %v with %v workers for host %v",
+			ci.ComponentName, *fc.cConfig.WorkerNumber, fc.kConfig.Host)
+
+		for i := int32(0); i < *fc.cConfig.WorkerNumber; i++ {
+			// id is dedicated for each iteration, while i is not.
+			id := i
+			go wait.Until(func() { is.worker(fc, id) }, time.Second, stopCh)
+		}
+	}
+
+	<-stopCh
+}
 
 func NewFrameworkController() *FrameworkController {
 	log.Infof("Initializing " + ci.ComponentName)
@@ -592,6 +709,7 @@ func (c *FrameworkController) getPodOwner(pod *core.Pod) *core.ConfigMap {
 }
 
 func (c *FrameworkController) Run(stopCh <-chan struct{}) {
+	/**/
 	defer c.fQueue.ShutDown()
 	defer log.Errorf("Stopping " + ci.ComponentName)
 	defer runtime.HandleCrash()
@@ -624,6 +742,8 @@ func (c *FrameworkController) Run(stopCh <-chan struct{}) {
 		id := i
 		go wait.Until(func() { c.worker(id) }, time.Second, stopCh)
 	}
+	/**/
+	//	go NewInterdomScheduler(c).Run(stopCh)
 
 	<-stopCh
 }

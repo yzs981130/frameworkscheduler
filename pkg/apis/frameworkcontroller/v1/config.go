@@ -29,6 +29,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"github.com/microsoft/frameworkcontroller/pkg/common"
+	"path/filepath"
 )
 
 type Config struct {
@@ -76,6 +77,37 @@ type Config struct {
 	// all-or-nothing fashion in order to perform any useful work.
 	FrameworkMinRetryDelaySecForTransientConflictFailed *int64 `yaml:"frameworkMinRetryDelaySecForTransientConflictFailed"`
 	FrameworkMaxRetryDelaySecForTransientConflictFailed *int64 `yaml:"frameworkMaxRetryDelaySecForTransientConflictFailed"`
+}
+
+func NewRemoteConfigs() []*Config {
+	var files []string
+	root := os.Getenv("HOME") + "/.kube/remote"
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			common.LogLines("Walk %v with err: %v", path, err)
+		} else if !info.IsDir() {
+	        files = append(files, path)
+		}
+        return nil
+    })
+	if err != nil {
+		common.LogLines("Walk root %v with err: %v", root, err)
+		return make([]*Config, 0)
+	}
+	var configs []*Config 
+	for _, path := range files {
+		c := &Config{
+			KubeApiServerAddress: common.PtrString(""),
+			KubeConfigFilePath: common.PtrString(path),
+			WorkerNumber: common.PtrInt32(1),
+			CRDEstablishedCheckIntervalSec: common.PtrInt64(1),
+			ObjectLocalCacheCreationTimeoutSec: common.PtrInt64(5 * 60),
+			FrameworkMinRetryDelaySecForTransientConflictFailed: common.PtrInt64(60),
+			FrameworkMaxRetryDelaySecForTransientConflictFailed: common.PtrInt64(15 * 60),
+		}
+		configs = append(configs, c)
+	}
+	return configs
 }
 
 func NewConfig() *Config {
