@@ -76,9 +76,15 @@ const (
 	AnnotationKeyScheduleCategory   string = "openi.cn/schedule-category"
 	AnnotationKeyScheduleZone       string = "openi.cn/schedule-zone"
 	AnnotationKeySchedulePreemption string = "openi.cn/schedule-preemption"
+	AnnotationKeyScheduleRemotable  string = "openi.cn/schedule-remotable"
 
-	LabelKeyScheduleCategory string = AnnotationKeyScheduleCategory
-	LabelKeyScheduleZone     string = AnnotationKeyScheduleZone
+	LabelKeyScheduleCategory  string = AnnotationKeyScheduleCategory
+	LabelKeyScheduleZone      string = AnnotationKeyScheduleZone
+	LabelKeyScheduleRemotable string = AnnotationKeyScheduleRemotable
+	LabelKeyScheduleRemoted   string = "openi.cn/schedule-remoted"
+	LabelKeyRemoteRequest     string = "openi.cn/remote-request"
+	LabelKeyRemoteResponse    string = "openi.cn/remote-response"
+	
 
 	TimeoutOfRefreshZoneList time.Duration = 100 * time.Millisecond
 	TimeoutOfFrameworkSync   time.Duration = 30 * time.Second
