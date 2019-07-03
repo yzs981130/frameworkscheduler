@@ -92,19 +92,20 @@ type SkdPod struct {
 }
 
 type SkdFramework struct {
-	Key              string
-	Name             string
-	Namespace        string
-	ScheduleCategory string
-	ScheduleZone     string
+	Key               string
+	Name              string
+	Namespace         string
+	ScheduleCategory  string
+	ScheduleZone      string
 	ScheduleRemoteble string
-	QueuingTimestamp time.Time
-	Zone             *SkdZone
-	Resources        SkdResourceRequirements
-	LastSync         time.Time
-	Remote struct {
-		Host string
-		State ci.RemoteState
+	QueuingTimestamp  time.Time
+	Zone              *SkdZone
+	Resources         SkdResourceRequirements
+	LastSync          time.Time
+	Remote            struct {
+		Host    string
+		State   ci.RemoteState
+		Request string
 	}
 }
 
@@ -127,10 +128,10 @@ type SkdZone struct {
 }
 
 type FrameworkScheduler struct {
-	fmQueuing map[string]*SkdFramework
-	fmWaiting map[string]*SkdFramework
-	fmPending map[string]*SkdFramework
-	fmRemoting       map[string]*SkdFramework
+	fmQueuing  map[string]*SkdFramework
+	fmWaiting  map[string]*SkdFramework
+	fmPending  map[string]*SkdFramework
+	fmRemoting map[string]*SkdFramework
 
 	podLister    coreLister.PodLister
 	fLister      frameworkLister.FrameworkLister
@@ -138,9 +139,9 @@ type FrameworkScheduler struct {
 	nodeLister   coreLister.NodeLister
 	fQueue       workqueue.RateLimitingInterface
 
-	lockOnQueuing *sync.RWMutex
-	lockOnWaiting *sync.RWMutex
-	lockOnPending *sync.RWMutex
+	lockOnQueuing  *sync.RWMutex
+	lockOnWaiting  *sync.RWMutex
+	lockOnPending  *sync.RWMutex
 	lockOnRemoting *sync.RWMutex
 
 	lockOnHostIP *sync.RWMutex
@@ -319,6 +320,11 @@ func (s *FrameworkScheduler) enqueueKey(prefix string, key string) {
 
 func (s *FrameworkScheduler) enqueueFrameworkKey(key string) {
 	s.fQueue.AddRateLimited(key)
+}
+
+func (s *FrameworkScheduler) enqueueKeyAfter(key string, after int64) {
+	duration := time.Duration(int64(time.Second) * after)
+	s.fQueue.AddAfter(key, duration)
 }
 
 func HasPrefixPod(key interface{}) bool {
@@ -987,7 +993,6 @@ func (s *FrameworkScheduler) syncZone(key string) (returnedErr error) {
 		skdZone = s.CreateSkdZone(category, zone)
 	}
 
-	
 	skdZone.LastInformed = time.Now()
 	skdZone.RefreshTotalCapacity()
 
@@ -1000,8 +1005,8 @@ func (s *FrameworkScheduler) syncZone(key string) (returnedErr error) {
 	free := skdZone.TotalCapacity
 	for _, skdPod := range pods {
 		free.CPU -= MaxInt64(skdPod.Resources.Limits.CPU, skdPod.Resources.Requests.CPU)
-        free.Memory -= MaxInt64(skdPod.Resources.Limits.Memory,skdPod.Resources.Requests.Memory)
-        free.GPU -= MaxInt64(skdPod.Resources.Limits.GPU,skdPod.Resources.Requests.GPU)
+		free.Memory -= MaxInt64(skdPod.Resources.Limits.Memory, skdPod.Resources.Requests.Memory)
+		free.GPU -= MaxInt64(skdPod.Resources.Limits.GPU, skdPod.Resources.Requests.GPU)
 	}
 	skdZone.TotalFree = free
 
@@ -1464,8 +1469,10 @@ func (s *FrameworkScheduler) scheduleZoneForPending(skdZone *SkdZone) {
 }
 
 func (s *FrameworkScheduler) syncFrameworkState(f *ci.Framework) bool {
-	// preschedule for remote
-	s.syncRemoteState(f)
+	/*/ TODO: Preschedule for remote
+	if s.syncRemoteState(f) {
+		return true
+	} /*/
 
 	if f.Status.State == ci.FrameworkAttemptCreationQueuing {
 		fwk, exists := s.checkForWaiting(f)
@@ -1514,42 +1521,99 @@ func (s *FrameworkScheduler) syncFrameworkState(f *ci.Framework) bool {
 	return false
 }
 
-func (s *FrameworkScheduler) syncRemoteState(f *ci.Framework) {
-	/*
-	fwk := lookupRemotingFramework(f.Key())
+func GetFrameworkLabel(f *ci.Framework, key string) string {
+	if value, ok := f.Labels[key]; ok {
+		return value
+	}
+	return ""
+}
+
+func SetFrameworkLabel(f *ci.Framework, key string, value string) {
+	if f.Labels == nil {
+		f.Labels = make(map[string]string)
+	}
+	f.Labels[key] = value
+}
+
+func (fwk *SkdFramework) transitionRemoteState(newState ci.RemoteState) {
+	fwk.Remote.State = newState
+}
+
+func (s *FrameworkScheduler) lookupRemotingFramework(key string) *SkdFramework {
+	ReadLock(s.lockOnRemoting)
+	defer ReadUnlock(s.lockOnRemoting)
+	if fwk, ok := s.fmRemoting[key]; ok {
+		return fwk
+	}
+	return nil
+}
+
+func (s *FrameworkScheduler) syncRemoteState(f *ci.Framework) bool {
+	fwk := s.lookupRemotingFramework(f.Key())
 	if fwk == nil {
 		if f.Status.State == ci.FrameworkAttemptCreationRemoting {
 			// TODO: Recovering from restart of framework controler
 			f.TransitionFrameworkState(ci.FrameworkAttemptCreationQueuing)
 		}
-		return
+		return false
 	}
+	fwk.resyncFramework(f)
 	defer func() {
-		enqueueFrameworkKey(f.Key)
+		if fwk.Remote.State == ci.RemoteWaking {
+			s.enqueueKeyAfter(fwk.Key, 1)
+		} else if fwk.Remote.State == ci.RemoteRequestAllowed {
+			s.enqueueKeyAfter(fwk.Key, 3)
+		} else {
+			s.enqueueKeyAfter(fwk.Key, 5)
+		}
 	}()
 	if fwk.Remote.State == ci.RemoteWaking {
-		SetFrameworkLabel(f, LableKeyScheduleRemotable, ci.RemoteEnabled)
-		SetFrameworkLabel(f, LabelKeyScheduleRemoted, ci.RemoteEmpty)
-		SetFrameworkLabel(f, LabelKeyRemoteRequest, ci.RemoteEmpty)
-		SetFrameworkLabel(f, LabelKeyRemoteResponse, ci.RemoteEmpty)
-		fwk.Remote.State = ci.RemoteRequestAllowed
-	}
-	if fwk.Remote.State == ci.RemoteRequestAllowed {
-		request := GetFrameworkLabel(f, LabelKeyRemoteRequest)
+		SetFrameworkLabel(f, ci.LabelKeyScheduleRemotable, ci.RemoteEnabled)
+		SetFrameworkLabel(f, ci.LabelKeyScheduleRemoted, ci.RemoteEmpty)
+		SetFrameworkLabel(f, ci.LabelKeyRemoteRequest, ci.RemoteEmpty)
+		SetFrameworkLabel(f, ci.LabelKeyRemoteResponse, ci.RemoteEmpty)
+		fwk.transitionRemoteState(ci.RemoteRequestAllowed)
+		return true
+	} else if fwk.Remote.State == ci.RemoteRequestAllowed {
+		request := GetFrameworkLabel(f, ci.LabelKeyRemoteRequest)
 		if request != ci.RemoteEmpty {
 			fwk.Remote.Host = request
-			fwk.Remote.State = ci.RemoteRequestRecieved
+			fwk.Remote.Request = request
+			fwk.transitionRemoteState(ci.RemoteRequestRecieved)
 			if f.Status.State == ci.FrameworkAttemptCreationQueuing {
-				if s.checkForWaiting(f) {
-					s.deleteFrameworkFromWaiting(f)
-				} else {
-					s.deleteFrameworkFromQueuing(f)
-				}
 				f.TransitionFrameworkState(ci.FrameworkAttemptCreationRemoting)
+				s.deleteFrameworkFromQueuing(fwk.Key)
+				return true
 			}
 		}
+		if f.Status.State != ci.FrameworkAttemptCreationQueuing {
+			SetFrameworkLabel(f, ci.LabelKeyScheduleRemoted, ci.RemoteDinied)
+			fwk.transitionRemoteState(ci.RemoteRequestDenied)
+		}
+		return false
+	} else if fwk.Remote.State == ci.RemoteRequestRecieved {
+		return false
+	} else if fwk.Remote.State == ci.RemoteRequestRecieved {
+		if f.Status.State == ci.FrameworkAttemptCreationRemoting {
+			if fwk.Zone != nil {
+				if _, exists := s.checkForWaiting(f); exists {
+					s.deleteFrameworkFromWaiting(fwk.Key)
+				} else {
+					fwk.Zone.deleteFrameworkFromWaiting(fwk.Key)
+				}
+				fwk.Zone.freeReservedResourcesOfFramework(fwk)
+				fwk.Zone = nil
+			}
+			SetFrameworkLabel(f, ci.LabelKeyScheduleRemoted, fwk.Remote.Request)
+			fwk.transitionRemoteState(ci.RemoteRequestAccepted)
+			return true
+		}
+		panic(fmt.Sprintf("f.Status.State should be %v while fwk.Remote.State is %v!",
+			ci.FrameworkAttemptCreationRemoting,
+			ci.RemoteRequestRecieved))
+		return false
 	}
-	*/
+	return false
 }
 
 func GetFrameworkAnnotation(f *ci.Framework, key string, defaultVal string) string {

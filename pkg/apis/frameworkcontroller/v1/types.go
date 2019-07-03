@@ -417,6 +417,8 @@ const (
         // -> FrameworkAttemptCreationPending
         FrameworkAttemptCreationWaiting FrameworkState = "AttemptCreationWaiting"
 
+		FrameworkAttemptCreationRemoting FrameworkState = "AttemptCreationRemoting"
+
 	// ConfigMap does not exist and
 	// has not been creation requested.
 	// [AttemptStartState]
@@ -599,6 +601,8 @@ const (
 	// -> RemoteFrameworkFailed
 	// -> RemoteFrameworkCompleted
 	RemoteRequestAccepted RemoteState = "RequestAccepted"
+	RemoteRequestDenied RemoteState = "RequestDenied"
+	RemoteRequestCanceled RemoteState = "RequestCanceled"
 
 	// Remote site is cloning the framework
 	// -> RemoteFrameworkFailed

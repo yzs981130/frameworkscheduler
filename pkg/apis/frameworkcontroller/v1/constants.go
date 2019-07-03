@@ -76,6 +76,7 @@ const (
 	RemoteEnabled  string = "true"
 	RemoteDisabled string = "false"
 	RemoteEmpty    string = ""
+	RemoteDinied   string = "dinied"
 
 	AnnotationKeyScheduleCategory   string = "openi.cn/schedule-category"
 	AnnotationKeyScheduleZone       string = "openi.cn/schedule-zone"
@@ -88,7 +89,6 @@ const (
 	LabelKeyScheduleRemoted   string = "openi.cn/schedule-remoted"
 	LabelKeyRemoteRequest     string = "openi.cn/remote-request"
 	LabelKeyRemoteResponse    string = "openi.cn/remote-response"
-	
 
 	TimeoutOfRefreshZoneList time.Duration = 100 * time.Millisecond
 	TimeoutOfFrameworkSync   time.Duration = 30 * time.Second
