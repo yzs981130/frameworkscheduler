@@ -73,6 +73,10 @@ const (
 	DefaultScheduleZone     string = "default"
 	DefaultZoneKey          string = "default/default"
 
+	RemoteEnabled  string = "true"
+	RemoteDisabled string = "false"
+	RemoteEmpty    string = ""
+
 	AnnotationKeyScheduleCategory   string = "openi.cn/schedule-category"
 	AnnotationKeyScheduleZone       string = "openi.cn/schedule-zone"
 	AnnotationKeySchedulePreemption string = "openi.cn/schedule-preemption"

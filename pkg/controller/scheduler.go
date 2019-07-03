@@ -75,7 +75,7 @@ type SkdNode struct {
 	Allocatable      SkdResources
 	Allocated        SkdResources
 	Free             SkdResources
-	lockOfPods       *sync.RWMutex
+	lockOnPods       *sync.RWMutex
 	Pods             map[string]*SkdPod
 	LastInformed     time.Time
 }
@@ -97,11 +97,15 @@ type SkdFramework struct {
 	Namespace        string
 	ScheduleCategory string
 	ScheduleZone     string
+	ScheduleRemoteble string
 	QueuingTimestamp time.Time
-	ZoneKey          string
 	Zone             *SkdZone
 	Resources        SkdResourceRequirements
 	LastSync         time.Time
+	Remote struct {
+		Host string
+		State ci.RemoteState
+	}
 }
 
 type SkdZone struct {
@@ -112,17 +116,21 @@ type SkdZone struct {
 	TotalAllocated   SkdResources
 	TotalFree        SkdResources
 	TotalProvision   SkdResources
-	lockOfNodes      *sync.RWMutex
-	lockOfWaiting    *sync.RWMutex
+	lockOnNodes      *sync.RWMutex
+	lockOnWaiting    *sync.RWMutex
 	Nodes            map[string]*SkdNode
 	fmWaiting        map[string]*SkdFramework
 	LastInformed     time.Time
+	Alive            bool
+	lockOnResources  *sync.Mutex
+	lockOnProvision  *sync.Mutex
 }
 
-type GlobalScheduler struct {
+type FrameworkScheduler struct {
 	fmQueuing map[string]*SkdFramework
 	fmWaiting map[string]*SkdFramework
 	fmPending map[string]*SkdFramework
+	fmRemoting       map[string]*SkdFramework
 
 	podLister    coreLister.PodLister
 	fLister      frameworkLister.FrameworkLister
@@ -130,14 +138,15 @@ type GlobalScheduler struct {
 	nodeLister   coreLister.NodeLister
 	fQueue       workqueue.RateLimitingInterface
 
-	lockOfQueuing *sync.RWMutex
-	lockOfWaiting *sync.RWMutex
-	lockOfPending *sync.RWMutex
+	lockOnQueuing *sync.RWMutex
+	lockOnWaiting *sync.RWMutex
+	lockOnPending *sync.RWMutex
+	lockOnRemoting *sync.RWMutex
 
-	lockOfHostIP *sync.RWMutex
-	lockOfNodes  *sync.RWMutex
-	lockOfPods   *sync.RWMutex
-	lockOfZones  *sync.RWMutex
+	lockOnHostIP *sync.RWMutex
+	lockOnNodes  *sync.RWMutex
+	lockOnPods   *sync.RWMutex
+	lockOnZones  *sync.RWMutex
 
 	hostIP2node map[string]string
 	nodes       map[string]string
@@ -147,6 +156,7 @@ type GlobalScheduler struct {
 
 	lastModifiedZone      time.Time
 	lastRefreshedZoneList time.Time
+	oldestSyncTime        time.Time
 }
 
 type InterdomScheduler struct {
@@ -267,7 +277,7 @@ func (is *InterdomScheduler) Run(stopCh <-chan struct{}) {
 }
 
 // obj could be *core.Pod or cache.DeletedFinalStateUnknown.
-func (s *GlobalScheduler) enqueuePodObj(obj interface{}, msg string) {
+func (s *FrameworkScheduler) enqueuePodObj(obj interface{}, msg string) {
 	key, err := util.GetKey(obj)
 	if err != nil {
 		log.Errorf("Failed to get key for pod %#v, skip to enqueue: %v", obj, err)
@@ -278,7 +288,7 @@ func (s *GlobalScheduler) enqueuePodObj(obj interface{}, msg string) {
 }
 
 // obj could be *core.Node or cache.DeletedFinalStateUnknown.
-func (s *GlobalScheduler) enqueueNodeObj(obj interface{}, msg string) {
+func (s *FrameworkScheduler) enqueueNodeObj(obj interface{}, msg string) {
 	key, err := util.GetKey(obj)
 	if err != nil {
 		log.Errorf("Failed to get key for node %#v, skip to enqueue: %v", obj, err)
@@ -288,26 +298,26 @@ func (s *GlobalScheduler) enqueueNodeObj(obj interface{}, msg string) {
 	log.Infof("[%v]: enqueueNodeObj: %v", key, msg)
 }
 
-func (s *GlobalScheduler) enqueuePodKey(key string) {
+func (s *FrameworkScheduler) enqueuePodKey(key string) {
 	s.enqueueKey(ci.QueueKeyPrefixPod, key)
 	log.Infof("[%v]: enqueuePodKey.", key)
 }
 
-func (s *GlobalScheduler) enqueueNodeKey(key string) {
+func (s *FrameworkScheduler) enqueueNodeKey(key string) {
 	s.enqueueKey(ci.QueueKeyPrefixNode, key)
 	log.Infof("[%v]: enqueueNodeKey.", key)
 }
 
-func (s *GlobalScheduler) enqueueZoneKey(key string) {
+func (s *FrameworkScheduler) enqueueZoneKey(key string) {
 	s.enqueueKey(ci.QueueKeyPrefixZone, key)
 	log.Infof("[%v]: enqueueZoneKey.", key)
 }
 
-func (s *GlobalScheduler) enqueueKey(prefix string, key string) {
+func (s *FrameworkScheduler) enqueueKey(prefix string, key string) {
 	s.fQueue.AddRateLimited(fmt.Sprintf("%v%v", prefix, key))
 }
 
-func (s *GlobalScheduler) enqueueFrameworkKey(key string) {
+func (s *FrameworkScheduler) enqueueFrameworkKey(key string) {
 	s.fQueue.AddRateLimited(key)
 }
 
@@ -335,9 +345,9 @@ func GetZoneKey(key interface{}) string {
 	return key.(string)[len(ci.QueueKeyPrefixZone):]
 }
 
-func (s *GlobalScheduler) lookupNodeKeyByPod(key string) (string, bool) {
-	ReadLock(s.lockOfPods)
-	defer ReadUnlock(s.lockOfPods)
+func (s *FrameworkScheduler) lookupNodeKeyByPod(key string) (string, bool) {
+	ReadLock(s.lockOnPods)
+	defer ReadUnlock(s.lockOnPods)
 	nodeKey, ok := s.pods[key]
 	if ok {
 		return nodeKey, true
@@ -346,9 +356,9 @@ func (s *GlobalScheduler) lookupNodeKeyByPod(key string) (string, bool) {
 	}
 }
 
-func (s *GlobalScheduler) lookupZoneKeyByNode(key string) (string, bool) {
-	ReadLock(s.lockOfNodes)
-	defer ReadUnlock(s.lockOfNodes)
+func (s *FrameworkScheduler) lookupZoneKeyByNode(key string) (string, bool) {
+	ReadLock(s.lockOnNodes)
+	defer ReadUnlock(s.lockOnNodes)
 	zoneKey, ok := s.nodes[key]
 	if ok {
 		return zoneKey, true
@@ -357,19 +367,19 @@ func (s *GlobalScheduler) lookupZoneKeyByNode(key string) (string, bool) {
 	}
 }
 
-func (s *GlobalScheduler) cleanupPodKey(key string) {
-	WriteLock(s.lockOfPods)
-	defer WriteUnlock(s.lockOfPods)
+func (s *FrameworkScheduler) cleanupPodKey(key string) {
+	WriteLock(s.lockOnPods)
+	defer WriteUnlock(s.lockOnPods)
 	delete(s.pods, key)
 }
 
-func (s *GlobalScheduler) cleanupNodeKey(key string) {
-	WriteLock(s.lockOfNodes)
-	defer WriteUnlock(s.lockOfNodes)
+func (s *FrameworkScheduler) cleanupNodeKey(key string) {
+	WriteLock(s.lockOnNodes)
+	defer WriteUnlock(s.lockOnNodes)
 	delete(s.nodes, key)
 }
 
-func (s *GlobalScheduler) lookupPodByKey(key string) *SkdPod {
+func (s *FrameworkScheduler) lookupPodByKey(key string) *SkdPod {
 	nodeKey, ok := s.lookupNodeKeyByPod(key)
 	if !ok {
 		return nil
@@ -378,8 +388,8 @@ func (s *GlobalScheduler) lookupPodByKey(key string) *SkdPod {
 	if skdNode == nil {
 		return nil
 	}
-	ReadLock(skdNode.lockOfPods)
-	defer ReadUnlock(skdNode.lockOfPods)
+	ReadLock(skdNode.lockOnPods)
+	defer ReadUnlock(skdNode.lockOnPods)
 	skdPod, exists := skdNode.Pods[key]
 	if exists {
 		return skdPod
@@ -387,7 +397,7 @@ func (s *GlobalScheduler) lookupPodByKey(key string) *SkdPod {
 	return nil
 }
 
-func (s *GlobalScheduler) lookupNodeByKey(key string) *SkdNode {
+func (s *FrameworkScheduler) lookupNodeByKey(key string) *SkdNode {
 	zoneKey, ok := s.lookupZoneKeyByNode(key)
 	if !ok {
 		return nil
@@ -396,8 +406,8 @@ func (s *GlobalScheduler) lookupNodeByKey(key string) *SkdNode {
 	if skdZone == nil {
 		return nil
 	}
-	ReadLock(skdZone.lockOfNodes)
-	defer ReadUnlock(skdZone.lockOfNodes)
+	ReadLock(skdZone.lockOnNodes)
+	defer ReadUnlock(skdZone.lockOnNodes)
 	skdNode, exists := skdZone.Nodes[key]
 	if exists {
 		return skdNode
@@ -405,9 +415,9 @@ func (s *GlobalScheduler) lookupNodeByKey(key string) *SkdNode {
 	return nil
 }
 
-func (s *GlobalScheduler) lookupZoneByKey(key string) *SkdZone {
-	ReadLock(s.lockOfZones)
-	defer ReadUnlock(s.lockOfZones)
+func (s *FrameworkScheduler) lookupZoneByKey(key string) *SkdZone {
+	ReadLock(s.lockOnZones)
+	defer ReadUnlock(s.lockOnZones)
 	skdZone, exists := s.zones[key]
 	if exists {
 		return skdZone
@@ -415,7 +425,7 @@ func (s *GlobalScheduler) lookupZoneByKey(key string) *SkdZone {
 	return nil
 }
 
-func (s *GlobalScheduler) addPodToNode(skdPod *SkdPod) error {
+func (s *FrameworkScheduler) addPodToNode(skdPod *SkdPod) error {
 	nodeKey, ok := s.lookupNodeKeyByHostIP(skdPod.HostIP)
 	if !ok {
 		return fmt.Errorf("[%v] addPodToNode: Node with HostIP(=%v) is NOT found!",
@@ -427,51 +437,47 @@ func (s *GlobalScheduler) addPodToNode(skdPod *SkdPod) error {
 			skdPod.Key, nodeKey)
 	}
 	// Add skdPod to skdNode
-	WriteLock(skdNode.lockOfPods)
+	WriteLock(skdNode.lockOnPods)
 	func() {
-		defer WriteUnlock(skdNode.lockOfPods)
+		defer WriteUnlock(skdNode.lockOnPods)
 		skdNode.Pods[skdPod.Key] = skdPod
 		skdPod.Node = skdNode
 	}()
 	// Add the map of {skdPod.Key -> skdNode.Key}
-	WriteLock(s.lockOfPods)
+	WriteLock(s.lockOnPods)
 	func() {
-		defer WriteUnlock(s.lockOfPods)
+		defer WriteUnlock(s.lockOnPods)
 		s.pods[skdPod.Key] = nodeKey
 	}()
 	// pods in node changed, notify the node
 	s.enqueueNodeKey(nodeKey)
-	// Check the framework of the pod and free resources alloced to the framework.
-	// Resources are now alloced by pods of framework.
-	// TODO: pods on multiple nodes might be of the same framework
-	s.doneForPending(skdPod.FrameworkKey)
 	return nil
 }
 
-func (s *GlobalScheduler) addNodeToZone(skdNode *SkdNode) {
+func (s *FrameworkScheduler) addNodeToZone(skdNode *SkdNode) {
 	zoneKey := ToZoneKey(skdNode.ScheduleCategory, skdNode.ScheduleZone)
 	skdZone := s.lookupZoneByKey(zoneKey)
 	if skdZone == nil {
 		skdZone = s.CreateSkdZone(skdNode.ScheduleCategory, skdNode.ScheduleZone)
 	}
 	// Add skdNode to skdZone
-	WriteLock(skdZone.lockOfNodes)
+	WriteLock(skdZone.lockOnNodes)
 	func() {
-		defer WriteUnlock(skdZone.lockOfNodes)
+		defer WriteUnlock(skdZone.lockOnNodes)
 		skdZone.Nodes[skdNode.Key] = skdNode
 		skdNode.Zone = skdZone
 	}()
 	// Add the map of {skdNode.Key -> skdZone.Key}
-	WriteLock(s.lockOfNodes)
+	WriteLock(s.lockOnNodes)
 	func() {
-		defer WriteUnlock(s.lockOfNodes)
+		defer WriteUnlock(s.lockOnNodes)
 		s.nodes[skdNode.Key] = zoneKey
 	}()
 	// nodes in zone changed, notify the zone
 	s.enqueueZoneKey(zoneKey)
 }
 
-func (s *GlobalScheduler) CreateSkdZone(category string, zone string) *SkdZone {
+func (s *FrameworkScheduler) CreateSkdZone(category string, zone string) *SkdZone {
 	zoneKey := ToZoneKey(category, zone)
 	skdZone := &SkdZone{
 		Key:              zoneKey,
@@ -481,25 +487,29 @@ func (s *GlobalScheduler) CreateSkdZone(category string, zone string) *SkdZone {
 		TotalAllocated:   SkdResources{0, 0, 0},
 		TotalFree:        SkdResources{0, 0, 0},
 		TotalProvision:   SkdResources{0, 0, 0},
-		lockOfNodes:      new(sync.RWMutex),
-		lockOfWaiting:    new(sync.RWMutex),
+		lockOnNodes:      new(sync.RWMutex),
+		lockOnWaiting:    new(sync.RWMutex),
 		Nodes:            make(map[string]*SkdNode),
 		fmWaiting:        make(map[string]*SkdFramework),
 		LastInformed:     time.Now(),
+		Alive:            false,
+		lockOnResources:  new(sync.Mutex),
+		lockOnProvision:  new(sync.Mutex),
 	}
-	WriteLock(s.lockOfZones)
-	defer WriteUnlock(s.lockOfZones)
+	WriteLock(s.lockOnZones)
+	defer WriteUnlock(s.lockOnZones)
 	s.zones[zoneKey] = skdZone
+	s.lastModifiedZone = time.Now()
 	return skdZone
 }
 
-func (s *GlobalScheduler) deletePod(skdPod *SkdPod) {
+func (s *FrameworkScheduler) deletePod(skdPod *SkdPod) {
 	skdNode := skdPod.Node
 	if skdNode != nil {
 		// Delete pod from node
-		WriteLock(skdNode.lockOfPods)
+		WriteLock(skdNode.lockOnPods)
 		func() {
-			defer WriteUnlock(skdNode.lockOfPods)
+			defer WriteUnlock(skdNode.lockOnPods)
 			skdPod.Node = nil
 			delete(skdNode.Pods, skdPod.Key)
 		}()
@@ -509,13 +519,13 @@ func (s *GlobalScheduler) deletePod(skdPod *SkdPod) {
 	s.cleanupPodKey(skdPod.Key)
 }
 
-func (s *GlobalScheduler) deleteNode(skdNode *SkdNode) {
+func (s *FrameworkScheduler) deleteNode(skdNode *SkdNode) {
 	skdZone := skdNode.Zone
 	if skdZone != nil {
 		// Delete node from zone
-		WriteLock(skdZone.lockOfNodes)
+		WriteLock(skdZone.lockOnNodes)
 		func() {
-			defer WriteUnlock(skdZone.lockOfNodes)
+			defer WriteUnlock(skdZone.lockOnNodes)
 			skdNode.Zone = nil
 			delete(skdZone.Nodes, skdNode.Key)
 		}()
@@ -525,13 +535,14 @@ func (s *GlobalScheduler) deleteNode(skdNode *SkdNode) {
 	s.cleanupNodeKey(skdNode.Key)
 }
 
-func (s *GlobalScheduler) deleteZone(skdZone *SkdZone) {
-	WriteLock(s.lockOfZones)
-	defer WriteUnlock(s.lockOfZones)
+func (s *FrameworkScheduler) deleteZone(skdZone *SkdZone) {
+	WriteLock(s.lockOnZones)
+	defer WriteUnlock(s.lockOnZones)
 	delete(s.zones, skdZone.Key)
+	s.lastModifiedZone = time.Now()
 }
 
-func (s *GlobalScheduler) deletePodByKey(key string) {
+func (s *FrameworkScheduler) deletePodByKey(key string) {
 	skdPod := s.lookupPodByKey(key)
 	if skdPod != nil {
 		s.deletePod(skdPod)
@@ -540,7 +551,7 @@ func (s *GlobalScheduler) deletePodByKey(key string) {
 	}
 }
 
-func (s *GlobalScheduler) deleteNodeByKey(key string) {
+func (s *FrameworkScheduler) deleteNodeByKey(key string) {
 	skdNode := s.lookupNodeByKey(key)
 	if skdNode != nil {
 		s.deleteNode(skdNode)
@@ -549,7 +560,7 @@ func (s *GlobalScheduler) deleteNodeByKey(key string) {
 	}
 }
 
-func (s *GlobalScheduler) syncPod(key string) (returnedErr error) {
+func (s *FrameworkScheduler) syncPod(key string) (returnedErr error) {
 	startTime := time.Now()
 	logPfx := fmt.Sprintf("[%v]: syncPod: ", key)
 	log.Infof(logPfx + "Started")
@@ -667,9 +678,9 @@ func WriteUnlock(lock *sync.RWMutex) {
 	lock.Unlock()
 }
 
-func (s *GlobalScheduler) lookupNodeKeyByHostIP(hostIP string) (string, bool) {
-	ReadLock(s.lockOfHostIP)
-	defer ReadUnlock(s.lockOfHostIP)
+func (s *FrameworkScheduler) lookupNodeKeyByHostIP(hostIP string) (string, bool) {
+	ReadLock(s.lockOnHostIP)
+	defer ReadUnlock(s.lockOnHostIP)
 	nodeKey, ok := s.hostIP2node[hostIP]
 	if ok {
 		return nodeKey, ok
@@ -678,17 +689,17 @@ func (s *GlobalScheduler) lookupNodeKeyByHostIP(hostIP string) (string, bool) {
 	}
 }
 
-func (s *GlobalScheduler) setupHostIPtoNodeKey(hostIP string, nodeKey string) {
+func (s *FrameworkScheduler) setupHostIPtoNodeKey(hostIP string, nodeKey string) {
 	log.Infof("try map HostIP(=%v) to Node(=%v)", hostIP, nodeKey)
-	WriteLock(s.lockOfHostIP)
-	defer WriteUnlock(s.lockOfHostIP)
+	WriteLock(s.lockOnHostIP)
+	defer WriteUnlock(s.lockOnHostIP)
 	s.hostIP2node[hostIP] = nodeKey
 	log.Infof("map HostIP(=%v) to Node(=%v)", hostIP, nodeKey)
 }
 
-func (s *GlobalScheduler) cleanupHostIP(hostIP string) {
-	WriteLock(s.lockOfHostIP)
-	defer WriteUnlock(s.lockOfHostIP)
+func (s *FrameworkScheduler) cleanupHostIP(hostIP string) {
+	WriteLock(s.lockOnHostIP)
+	defer WriteUnlock(s.lockOnHostIP)
 	delete(s.hostIP2node, hostIP)
 }
 
@@ -754,7 +765,7 @@ func GetPodResourceRequests(kPod *core.Pod) (res SkdResources) {
 	return res
 }
 
-func (s *GlobalScheduler) syncNode(key string) (returnedErr error) {
+func (s *FrameworkScheduler) syncNode(key string) (returnedErr error) {
 	startTime := time.Now()
 	logPfx := fmt.Sprintf("[%v]: syncNode: ", key)
 	log.Infof(logPfx + "Started")
@@ -836,7 +847,7 @@ func (s *GlobalScheduler) syncNode(key string) (returnedErr error) {
 			Allocatable:      allocatable,
 			Allocated:        SkdResources{0, 0, 0},
 			Free:             SkdResources{0, 0, 0},
-			lockOfPods:       new(sync.RWMutex),
+			lockOnPods:       new(sync.RWMutex),
 			Pods:             make(map[string]*SkdPod),
 			LastInformed:     time.Now(),
 		}
@@ -847,9 +858,9 @@ func (s *GlobalScheduler) syncNode(key string) (returnedErr error) {
 
 	// Calculate free resources
 	skdNode.Allocated = SkdResources{0, 0, 0}
-	ReadLock(skdNode.lockOfPods)
+	ReadLock(skdNode.lockOnPods)
 	func() {
-		defer ReadUnlock(skdNode.lockOfPods)
+		defer ReadUnlock(skdNode.lockOnPods)
 		for _, skdPod := range skdNode.Pods {
 			if skdPod.HostIP != skdNode.HostIP {
 				continue
@@ -937,7 +948,15 @@ func GetNodeAllocatable(node *core.Node) SkdResources {
 	}
 }
 
-func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
+func MaxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	} else {
+		return b
+	}
+}
+
+func (s *FrameworkScheduler) syncZone(key string) (returnedErr error) {
 	startTime := time.Now()
 	logPfx := fmt.Sprintf("[%v]: syncZone: ", key)
 	log.Infof(logPfx + "Started")
@@ -968,39 +987,42 @@ func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
 		skdZone = s.CreateSkdZone(category, zone)
 	}
 
+	
 	skdZone.LastInformed = time.Now()
+	skdZone.RefreshTotalCapacity()
 
-	skdZone.RefreshTotalCapacityAndFree()
-
-	if skdZone.HasFreeProvision() {
-		fwk := s.ScheduleWaitingForZone(skdZone)
-		if fwk != nil {
-			if fwk.Zone == skdZone {
-				s.ScheduleWaitingToZone(fwk, skdZone)
-				log.Infof(logPfx+"ScheduleWaitingToZone(%v)", fwk.Key)
-			} else {
-				log.Infof(logPfx+"ScheduleWaitingForZone(%v)", fwk.Key)
-				s.enqueueFrameworkKey(fwk.Key)
-			}
-		} else {
-			fwk = s.ScheduleQueuingFramework(skdZone.ScheduleCategory)
-			if fwk != nil {
-				log.Infof(logPfx+"ScheduleQueuingFramework: %v -> %v",
-					fwk.Key, skdZone.ScheduleCategory)
-				fwk.ZoneKey = skdZone.Key
-				s.enqueueFrameworkKey(fwk.Key)
-			}
-		}
-	} else {
-		//fwk := s.ScheduleRemotableFramework(skdZone.ScheduleCategory)
+	if !skdZone.Alive {
+		return nil
 	}
 
-	if skdZone.HasFreeResources() {
-		fwk := s.ScheduleWaitingFramework(skdZone)
-		if fwk != nil {
-			log.Infof(logPfx+"ScheduleWaitingFramework(%v)", fwk.Key)
-			s.enqueueFrameworkKey(fwk.Key)
+	pods := skdZone.listPodsOnZone()
+
+	free := skdZone.TotalCapacity
+	for _, skdPod := range pods {
+		free.CPU -= MaxInt64(skdPod.Resources.Limits.CPU, skdPod.Resources.Requests.CPU)
+        free.Memory -= MaxInt64(skdPod.Resources.Limits.Memory,skdPod.Resources.Requests.Memory)
+        free.GPU -= MaxInt64(skdPod.Resources.Limits.GPU,skdPod.Resources.Requests.GPU)
+	}
+	skdZone.TotalFree = free
+
+	for _, skdPod := range pods {
+		s.doneForPending(skdPod.FrameworkKey)
+	}
+
+	var fnames sort.StringSlice = nil
+	for _, skdPod := range pods {
+		_, name, err := util.SplitKey(skdPod.FrameworkKey)
+		if err == nil && name != "" {
+			fnames = append(fnames, name)
 		}
+	}
+	fnames.Sort()
+
+	if skdZone.hasFreeProvision() {
+		s.scheduleZoneForWaiting(skdZone)
+	}
+	if skdZone.hasFreeResources() {
+		s.scheduleZoneForPending(skdZone)
 	}
 
 	log.Infof("[%v] syncZone: capa=%v", key, skdZone.TotalCapacity)
@@ -1008,12 +1030,11 @@ func (s *GlobalScheduler) syncZone(key string) (returnedErr error) {
 	log.Infof("[%v] syncZone: prov=%v", key, skdZone.TotalProvision)
 	log.Infof("[%v] syncZone: allc=%v", key, skdZone.TotalAllocated)
 
-	LogFrameworks(fmt.Sprintf("[%v] schedule: Queuing=", key), s.fmQueuing, s.lockOfQueuing)
-	LogFrameworks(fmt.Sprintf("[%v] schedule: Waiting=", key), s.fmWaiting, s.lockOfWaiting)
-	LogFrameworks(fmt.Sprintf("[%v] syncZone: Waiting=", key), skdZone.fmWaiting, skdZone.lockOfWaiting)
-	LogFrameworks(fmt.Sprintf("[%v] schedule: Pending=", key), s.fmPending, s.lockOfPending)
-
-	s.lastModifiedZone = time.Now()
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Queuing=", key), s.fmQueuing, s.lockOnQueuing)
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Waiting=", key), s.fmWaiting, s.lockOnWaiting)
+	LogFrameworks(fmt.Sprintf("[%v] syncZone: Waiting=", key), skdZone.fmWaiting, skdZone.lockOnWaiting)
+	LogFrameworks(fmt.Sprintf("[%v] schedule: Pending=", key), s.fmPending, s.lockOnPending)
+	log.Infof("[%v] schedule: Running={%v}", key, strings.Join(fnames, ","))
 
 	return nil
 }
@@ -1032,34 +1053,124 @@ func LogFrameworks(prefix string, fm map[string]*SkdFramework, lock *sync.RWMute
 	log.Infof("%v{%v}", prefix, strings.Join(fnames, ","))
 }
 
-func (z *SkdZone) RefreshTotalCapacityAndFree() {
+func (s *FrameworkScheduler) scheduleForWaiting() {
+	zoneList := s.refreshZoneList()
+	for _, skdZone := range zoneList {
+		if skdZone.Alive && skdZone.hasFreeProvision() {
+			s.scheduleZoneForWaiting(skdZone)
+		}
+	}
+}
+
+func (s *FrameworkScheduler) scheduleCategoryForWaiting(category string) {
+	zoneList := s.refreshZoneList()
+	for _, skdZone := range zoneList {
+		if TestScheduleCategory(category, skdZone.ScheduleCategory) {
+			if skdZone.Alive && skdZone.hasFreeProvision() {
+				s.scheduleZoneForWaiting(skdZone)
+			}
+		}
+	}
+}
+
+func (s *FrameworkScheduler) scheduleForPending() {
+	zoneList := s.refreshZoneList()
+	for _, skdZone := range zoneList {
+		if skdZone.Alive && skdZone.hasFreeResources() {
+			s.scheduleZoneForPending(skdZone)
+		}
+	}
+}
+
+func (s *FrameworkScheduler) scheduleCategoryForPending(category string) {
+	zoneList := s.refreshZoneList()
+	for _, skdZone := range zoneList {
+		if TestScheduleCategory(category, skdZone.ScheduleCategory) {
+			if skdZone.Alive && skdZone.hasFreeResources() {
+				s.scheduleZoneForPending(skdZone)
+			}
+		}
+	}
+}
+
+func (s *FrameworkScheduler) scheduleNewFrameworkOnWaiting(fwk *SkdFramework, f *ci.Framework) {
+	fwk.resyncFramework(f)
+	s.deleteFrameworkFromWaiting(fwk.Key)
+	skdZone := fwk.Zone
+	defer s.enqueueZoneKey(skdZone.Key)
+	if skdZone.hasFreeResources() {
+		fwks := fwk.Zone.listFrameworksOnWaiting()
+		for _, fk := range fwks {
+			if fwk.QueuingTimestamp.After(fk.QueuingTimestamp) {
+				skdZone.addFrameworkToWaiting(fwk)
+				return
+			}
+		}
+		if skdZone.allocResourcesForFramework(fwk) {
+			s.addFrameworkToPending(fwk)
+			skdZone.freeReservedResourcesOfFramework(fwk)
+			s.scheduleZoneForWaiting(skdZone)
+			return
+		}
+	}
+	skdZone.addFrameworkToWaiting(fwk)
+}
+
+func (s *FrameworkScheduler) scheduleRemotableFramework(category string) []*SkdFramework {
+	ReadLock(s.lockOnQueuing)
+	WriteLock(s.lockOnRemoting)
+	defer func() {
+		WriteUnlock(s.lockOnRemoting)
+		ReadUnlock(s.lockOnQueuing)
+	}()
+	var fwks []*SkdFramework
+	for key, fwk := range s.fmQueuing {
+		if fwk.ScheduleCategory == category &&
+			fwk.ScheduleRemoteble == ci.RemoteEnabled &&
+			fwk.Remote.State == ci.RemoteHibernated {
+			fwks = append(fwks, fwk)
+			s.fmRemoting[key] = fwk
+			fwk.Remote.State = ci.RemoteWaking
+		}
+	}
+	return fwks
+}
+
+func (z *SkdZone) RefreshTotalCapacity() {
 	var keys []string
 	totalCapacity := SkdResources{0, 0, 0}
-	totalFree := SkdResources{0, 0, 0}
 
-	ReadLock(z.lockOfNodes)
+	ReadLock(z.lockOnNodes)
 	func() {
-		defer ReadUnlock(z.lockOfNodes)
+		defer ReadUnlock(z.lockOnNodes)
 		keys = make([]string, 0, len(z.Nodes))
 		for key, skdNode := range z.Nodes {
 			keys = append(keys, key)
 			totalCapacity.CPU += skdNode.Capacity.CPU
 			totalCapacity.Memory += skdNode.Capacity.Memory
 			totalCapacity.GPU += skdNode.Capacity.GPU
-			totalFree.CPU += skdNode.Free.CPU
-			totalFree.Memory += skdNode.Free.Memory
-			totalFree.GPU += skdNode.Free.GPU
 		}
 	}()
 
-	z.TotalCapacity = totalCapacity
-	z.TotalFree = totalFree
+	z.lockOnResources.Lock()
+	z.lockOnProvision.Lock()
+	func() {
+		defer func() {
+			z.lockOnProvision.Unlock()
+			z.lockOnResources.Unlock()
+		}()
+		z.TotalCapacity = totalCapacity
+	}()
 
-	log.Infof("[%v] syncZone: nodes={%v}", z.Key, strings.Join(keys, ","))
+	z.Alive = (totalCapacity.CPU > 0 && totalCapacity.Memory > 0)
+
+	if z.Alive {
+		log.Infof("[%v] syncZone: nodes={%v}", z.Key, strings.Join(keys, ","))
+	}
 
 }
 
-func (z *SkdZone) HasFreeProvision() bool {
+func (z *SkdZone) hasFreeProvision() bool {
 	provision := z.TotalProvision
 	capacity := z.TotalCapacity
 	if capacity.GPU < provision.GPU {
@@ -1074,7 +1185,7 @@ func (z *SkdZone) HasFreeProvision() bool {
 	return true
 }
 
-func (z *SkdZone) HasFreeResources() bool {
+func (z *SkdZone) hasFreeResources() bool {
 	free := z.TotalFree
 	allocated := z.TotalAllocated
 	if free.GPU-allocated.GPU < 0 {
@@ -1089,43 +1200,51 @@ func (z *SkdZone) HasFreeResources() bool {
 	return true
 }
 
-func (z *SkdZone) ReserveResourcesForFramework(fwk *SkdFramework) {
-	provision := z.TotalProvision
-	requests := fwk.CalculateReservedResources()
-	provision.CPU += requests.CPU
-	provision.Memory += requests.Memory
-	provision.GPU += requests.GPU
-	z.TotalProvision = provision
+func (z *SkdZone) reserveResourcesForFramework(fwk *SkdFramework) bool {
+	requests := fwk.calculateReservedResources()
+	z.lockOnProvision.Lock()
+	defer z.lockOnProvision.Unlock()
+	if z.hasFreeProvision() {
+		z.TotalProvision.CPU += requests.CPU
+		z.TotalProvision.Memory += requests.Memory
+		z.TotalProvision.GPU += requests.GPU
+		return true
+	}
+	return false
 }
 
-func (z *SkdZone) FreeReservedResourcesOfFramework(fwk *SkdFramework) {
-	provision := z.TotalProvision
-	requests := fwk.CalculateReservedResources()
-	provision.CPU -= requests.CPU
-	provision.Memory -= requests.Memory
-	provision.GPU -= requests.GPU
-	z.TotalProvision = provision
+func (z *SkdZone) freeReservedResourcesOfFramework(fwk *SkdFramework) {
+	requests := fwk.calculateReservedResources()
+	z.lockOnProvision.Lock()
+	defer z.lockOnProvision.Unlock()
+	z.TotalProvision.CPU -= requests.CPU
+	z.TotalProvision.Memory -= requests.Memory
+	z.TotalProvision.GPU -= requests.GPU
 }
 
-func (z *SkdZone) AllocResourcesForFramework(fwk *SkdFramework) {
-	allocated := z.TotalAllocated
-	requests := fwk.CalculateReservedResources()
-	allocated.CPU += requests.CPU
-	allocated.Memory += requests.Memory
-	allocated.GPU += requests.GPU
-	z.TotalAllocated = allocated
+func (z *SkdZone) allocResourcesForFramework(fwk *SkdFramework) bool {
+	requests := fwk.calculateReservedResources()
+	z.lockOnResources.Lock()
+	defer z.lockOnResources.Unlock()
+	if z.hasFreeResources() {
+		z.TotalAllocated.CPU += requests.CPU
+		z.TotalAllocated.Memory += requests.Memory
+		z.TotalAllocated.GPU += requests.GPU
+		return true
+	}
+	return false
 }
 
-func (z *SkdZone) FreeResourcesOfFramework(fwk *SkdFramework) {
-	allocated := z.TotalAllocated
-	requests := fwk.CalculateReservedResources()
-	allocated.CPU -= requests.CPU
-	allocated.Memory -= requests.Memory
-	allocated.GPU -= requests.GPU
-	z.TotalAllocated = allocated
+func (z *SkdZone) freeResourcesOfFramework(fwk *SkdFramework) {
+	requests := fwk.calculateReservedResources()
+	z.lockOnResources.Lock()
+	defer z.lockOnResources.Unlock()
+	z.TotalAllocated.CPU -= requests.CPU
+	z.TotalAllocated.Memory -= requests.Memory
+	z.TotalAllocated.GPU -= requests.GPU
 }
 
-func (fwk *SkdFramework) CalculateReservedResources() SkdResources {
+func (fwk *SkdFramework) calculateReservedResources() SkdResources {
 	requests := fwk.Resources.Requests
 	limits := fwk.Resources.Limits
 	if limits.CPU > requests.CPU {
@@ -1140,68 +1259,114 @@ func (fwk *SkdFramework) CalculateReservedResources() SkdResources {
 	return requests
 }
 
-func (s *GlobalScheduler) ScheduleWaitingForZone(skdZone *SkdZone) *SkdFramework {
-	ReadLock(s.lockOfWaiting)
-	defer ReadUnlock(s.lockOfWaiting)
-	for _, fwk := range s.fmWaiting {
-		if fwk.Zone == skdZone {
-			return fwk
-		}
-		if fwk.ZoneKey == skdZone.Key {
-			return fwk
-		}
-	}
-	return nil
-}
-
-func (s *GlobalScheduler) ScheduleWaitingToZone(fwk *SkdFramework, skdZone *SkdZone) {
-	WriteLock(s.lockOfWaiting)
-	func() {
-		defer WriteUnlock(s.lockOfWaiting)
-		delete(s.fmWaiting, fwk.Key)
-	}()
-	WriteLock(skdZone.lockOfWaiting)
-	func() {
-		defer WriteUnlock(skdZone.lockOfWaiting)
-		skdZone.fmWaiting[fwk.Key] = fwk
-		skdZone.ReserveResourcesForFramework(fwk)
-	}()
-}
-
-func (s *GlobalScheduler) AddFrameworkToQueuing(fwk *SkdFramework) {
-	WriteLock(s.lockOfQueuing)
-	defer WriteUnlock(s.lockOfQueuing)
+func (s *FrameworkScheduler) addFrameworkToQueuing(fwk *SkdFramework) {
+	WriteLock(s.lockOnQueuing)
+	defer WriteUnlock(s.lockOnQueuing)
 	s.fmQueuing[fwk.Key] = fwk
 }
 
-func (s *GlobalScheduler) DeleteFrameworkFromQueuing(key string) {
-	WriteLock(s.lockOfQueuing)
-	defer WriteUnlock(s.lockOfQueuing)
+func (s *FrameworkScheduler) deleteFrameworkFromQueuing(key string) {
+	WriteLock(s.lockOnQueuing)
+	defer WriteUnlock(s.lockOnQueuing)
 	delete(s.fmQueuing, key)
 }
 
-func (s *GlobalScheduler) AddFrameworkToWaiting(fwk *SkdFramework) {
-	WriteLock(s.lockOfWaiting)
-	defer WriteUnlock(s.lockOfWaiting)
+func (s *FrameworkScheduler) listFrameworksOnQueuing() []*SkdFramework {
+	ReadLock(s.lockOnQueuing)
+	defer ReadUnlock(s.lockOnQueuing)
+	fwks := make([]*SkdFramework, 0, len(s.fmQueuing))
+	for _, fwk := range s.fmQueuing {
+		fwks = append(fwks, fwk)
+	}
+	return fwks
+}
+
+func (s *FrameworkScheduler) listFrameworksOfCategoryOnQueuing(category string) []*SkdFramework {
+	ReadLock(s.lockOnQueuing)
+	defer ReadUnlock(s.lockOnQueuing)
+	fwks := make([]*SkdFramework, 0, len(s.fmQueuing))
+	for _, fwk := range s.fmQueuing {
+		if TestScheduleCategory(fwk.ScheduleCategory, category) {
+			fwks = append(fwks, fwk)
+		}
+	}
+	return fwks
+}
+
+func (s *FrameworkScheduler) addFrameworkToWaiting(fwk *SkdFramework) {
+	WriteLock(s.lockOnWaiting)
+	defer WriteUnlock(s.lockOnWaiting)
 	s.fmWaiting[fwk.Key] = fwk
 }
 
-func (s *GlobalScheduler) DeleteFrameworkFromWaiting(key string) {
-	WriteLock(s.lockOfWaiting)
-	defer WriteUnlock(s.lockOfWaiting)
+func (s *FrameworkScheduler) deleteFrameworkFromWaiting(key string) {
+	WriteLock(s.lockOnWaiting)
+	defer WriteUnlock(s.lockOnWaiting)
 	delete(s.fmWaiting, key)
 }
 
-func (z *SkdZone) AddFrameworkToWaiting(fwk *SkdFramework) {
-	WriteLock(z.lockOfWaiting)
-	defer WriteUnlock(z.lockOfWaiting)
+func (z *SkdZone) addFrameworkToWaiting(fwk *SkdFramework) {
+	WriteLock(z.lockOnWaiting)
+	defer WriteUnlock(z.lockOnWaiting)
 	z.fmWaiting[fwk.Key] = fwk
 }
 
-func (z *SkdZone) DeleteFrameworkFromWaiting(key string) {
-	WriteLock(z.lockOfWaiting)
-	defer WriteUnlock(z.lockOfWaiting)
+func (z *SkdZone) deleteFrameworkFromWaiting(key string) {
+	WriteLock(z.lockOnWaiting)
+	defer WriteUnlock(z.lockOnWaiting)
 	delete(z.fmWaiting, key)
+}
+
+func (z *SkdZone) listFrameworksOnWaiting() []*SkdFramework {
+	ReadLock(z.lockOnWaiting)
+	defer ReadUnlock(z.lockOnWaiting)
+	fwks := make([]*SkdFramework, 0, len(z.fmWaiting))
+	for _, fwk := range z.fmWaiting {
+		fwks = append(fwks, fwk)
+	}
+	return fwks
+}
+
+func (s *FrameworkScheduler) addFrameworkToPending(fwk *SkdFramework) {
+	WriteLock(s.lockOnPending)
+	defer WriteUnlock(s.lockOnPending)
+	s.fmPending[fwk.Key] = fwk
+}
+
+func (s *FrameworkScheduler) deleteFrameworkFromPending(key string) {
+	WriteLock(s.lockOnPending)
+	defer WriteUnlock(s.lockOnPending)
+	delete(s.fmPending, key)
+}
+
+func (z *SkdZone) listNodesOnZone() []*SkdNode {
+	ReadLock(z.lockOnNodes)
+	defer ReadUnlock(z.lockOnNodes)
+	nodes := make([]*SkdNode, 0, len(z.Nodes))
+	for _, skdNode := range z.Nodes {
+		nodes = append(nodes, skdNode)
+	}
+	return nodes
+}
+
+func (n *SkdNode) listPodsOnNode() []*SkdPod {
+	ReadLock(n.lockOnPods)
+	defer ReadUnlock(n.lockOnPods)
+	pods := make([]*SkdPod, 0, len(n.Pods))
+	for _, skdPod := range n.Pods {
+		pods = append(pods, skdPod)
+	}
+	return pods
+}
+
+func (z *SkdZone) listPodsOnZone() []*SkdPod {
+	var pods []*SkdPod
+	nodes := z.listNodesOnZone()
+	for _, skdNode := range nodes {
+		ps := skdNode.listPodsOnNode()
+		pods = append(pods, ps...)
+	}
+	return pods
 }
 
 func TestScheduleCategory(fwkCategory, category string) bool {
@@ -1214,94 +1379,177 @@ func TestScheduleCategory(fwkCategory, category string) bool {
 	return false
 }
 
-func (s *GlobalScheduler) ResyncFrameworkQueuingTimestamp(fwk *SkdFramework) bool {
-	now := time.Now()
-	if now.Sub(fwk.LastSync) > ci.TimeoutOfFrameworkSync {
-		f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
-		if err != nil {
-			if apiErrors.IsNotFound(err) {
-				// framework does not exist, should delete it
+func (s *FrameworkScheduler) resyncFrameworks() {
+	type ListFunc func() []*SkdFramework
+	var funcs []ListFunc
+	fnc := func() []*SkdFramework {
+		return s.listFrameworksOnQueuing()
+	}
+	funcs = append(funcs, fnc)
+	for _, fnc := range funcs {
+		fwks := fnc()
+		now := time.Now()
+		for _, fwk := range fwks {
+			if now.Sub(fwk.LastSync) > ci.TimeoutOfFrameworkSync {
+				f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
+				if err != nil {
+					if apiErrors.IsNotFound(err) {
+						s.enqueueFrameworkKey(fwk.Key)
+					}
+				} else if f.DeletionTimestamp != nil {
+					s.enqueueFrameworkKey(fwk.Key)
+				}
+				fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
+				fwk.LastSync = now
+			}
+			now = time.Now()
+			//log.Infof("resync: %v - %v", fwk.Key, fwk.QueuingTimestamp)
+		}
+	}
+}
+
+func (s *FrameworkScheduler) scheduleZoneForWaiting(skdZone *SkdZone) {
+	defer s.enqueueZoneKey(skdZone.Key)
+	for {
+		var nextWaiting *SkdFramework = nil
+		fwks := s.listFrameworksOfCategoryOnQueuing(skdZone.ScheduleCategory)
+		for _, fwk := range fwks {
+			if nextWaiting == nil {
+				nextWaiting = fwk
+			}
+			if fwk.QueuingTimestamp.Before(nextWaiting.QueuingTimestamp) {
+				nextWaiting = fwk
+			}
+		}
+		if nextWaiting == nil {
+			return
+		}
+		if skdZone.reserveResourcesForFramework(nextWaiting) {
+			nextWaiting.Zone = skdZone
+			s.addFrameworkToWaiting(nextWaiting)
+			s.deleteFrameworkFromQueuing(nextWaiting.Key)
+			s.enqueueFrameworkKey(nextWaiting.Key)
+		} else {
+			return
+		}
+	}
+}
+
+func (s *FrameworkScheduler) scheduleZoneForPending(skdZone *SkdZone) {
+	defer s.enqueueZoneKey(skdZone.Key)
+	for {
+		var nextPending *SkdFramework = nil
+		fwks := skdZone.listFrameworksOnWaiting()
+		for _, fwk := range fwks {
+			if nextPending == nil {
+				nextPending = fwk
+			}
+			if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
+				nextPending = fwk
+			}
+		}
+		if nextPending == nil {
+			return
+		}
+		if skdZone.allocResourcesForFramework(nextPending) {
+			s.addFrameworkToPending(nextPending)
+			skdZone.deleteFrameworkFromWaiting(nextPending.Key)
+			skdZone.freeReservedResourcesOfFramework(nextPending)
+			s.enqueueFrameworkKey(nextPending.Key)
+			s.scheduleZoneForWaiting(skdZone)
+		} else {
+			return
+		}
+	}
+}
+
+func (s *FrameworkScheduler) syncFrameworkState(f *ci.Framework) bool {
+	// preschedule for remote
+	s.syncRemoteState(f)
+
+	if f.Status.State == ci.FrameworkAttemptCreationQueuing {
+		fwk, exists := s.checkForWaiting(f)
+		if exists {
+			f.TransitionFrameworkState(ci.FrameworkAttemptCreationWaiting)
+			s.scheduleNewFrameworkOnWaiting(fwk, f)
+		} else {
+			fwk, exists = s.addToQueuing(f)
+			if exists {
+				s.scheduleForWaiting()
+			} else {
+				s.scheduleCategoryForWaiting(fwk.ScheduleCategory)
+			}
+			if fwk, exists = s.checkForWaiting(f); !exists {
+				return true
+			}
+			f.TransitionFrameworkState(ci.FrameworkAttemptCreationWaiting)
+			s.scheduleNewFrameworkOnWaiting(fwk, f)
+		}
+	}
+
+	if f.Status.State == ci.FrameworkAttemptCreationWaiting {
+		fwk, exists := s.checkForPending(f)
+		if exists {
+			f.TransitionFrameworkState(ci.FrameworkAttemptCreationPending)
+			s.bindFrameworkToZone(fwk, f)
+			return false
+		} else {
+			fwk, exists = s.lookupFrameworkOnWaiting(f.Key())
+			if !exists {
+				fwk, _ := s.addToQueuing(f)
+				f.TransitionFrameworkState(ci.FrameworkAttemptCreationQueuing)
+				s.scheduleCategoryForWaiting(fwk.ScheduleCategory)
+				return true
+			}
+			fwk.resyncFramework(f)
+			s.scheduleCategoryForPending(fwk.ScheduleCategory)
+			if fwk, exists = s.checkForPending(f); exists {
+				f.TransitionFrameworkState(ci.FrameworkAttemptCreationPending)
+				s.bindFrameworkToZone(fwk, f)
 				return false
 			}
 			return true
-		} else if f.DeletionTimestamp != nil {
-			// framework is being deleted, so it should be deleted
-			return false
 		}
-		fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
-		fwk.LastSync = now
-		//log.Infof("SQueuing: Sync %v - %v", fwk.Key, fwk.QueuingTimestamp)
 	}
-	return true
+	return false
 }
 
-func (s *GlobalScheduler) ScheduleQueuingFramework(scheduleCategory string) *SkdFramework {
-	var nextWaiting *SkdFramework = nil
-	fwks := make([]*SkdFramework, 0)
-	ReadLock(s.lockOfQueuing)
-	func() {
-		defer ReadUnlock(s.lockOfQueuing)
-		for _, fwk := range s.fmQueuing {
-			fwks = append(fwks, fwk)
+func (s *FrameworkScheduler) syncRemoteState(f *ci.Framework) {
+	/*
+	fwk := lookupRemotingFramework(f.Key())
+	if fwk == nil {
+		if f.Status.State == ci.FrameworkAttemptCreationRemoting {
+			// TODO: Recovering from restart of framework controler
+			f.TransitionFrameworkState(ci.FrameworkAttemptCreationQueuing)
 		}
+		return
+	}
+	defer func() {
+		enqueueFrameworkKey(f.Key)
 	}()
-	for _, fwk := range fwks {
-		if s.ResyncFrameworkQueuingTimestamp(fwk) {
-			if TestScheduleCategory(fwk.ScheduleCategory, scheduleCategory) {
-				if nextWaiting == nil {
-					nextWaiting = fwk
+	if fwk.Remote.State == ci.RemoteWaking {
+		SetFrameworkLabel(f, LableKeyScheduleRemotable, ci.RemoteEnabled)
+		SetFrameworkLabel(f, LabelKeyScheduleRemoted, ci.RemoteEmpty)
+		SetFrameworkLabel(f, LabelKeyRemoteRequest, ci.RemoteEmpty)
+		SetFrameworkLabel(f, LabelKeyRemoteResponse, ci.RemoteEmpty)
+		fwk.Remote.State = ci.RemoteRequestAllowed
+	}
+	if fwk.Remote.State == ci.RemoteRequestAllowed {
+		request := GetFrameworkLabel(f, LabelKeyRemoteRequest)
+		if request != ci.RemoteEmpty {
+			fwk.Remote.Host = request
+			fwk.Remote.State = ci.RemoteRequestRecieved
+			if f.Status.State == ci.FrameworkAttemptCreationQueuing {
+				if s.checkForWaiting(f) {
+					s.deleteFrameworkFromWaiting(f)
+				} else {
+					s.deleteFrameworkFromQueuing(f)
 				}
-				if fwk.QueuingTimestamp.Before(nextWaiting.QueuingTimestamp) {
-					nextWaiting = fwk
-				}
+				f.TransitionFrameworkState(ci.FrameworkAttemptCreationRemoting)
 			}
-		} else {
-			s.DeleteFrameworkFromQueuing(fwk.Key)
 		}
 	}
-	if nextWaiting != nil {
-		s.AddFrameworkToWaiting(nextWaiting)
-		s.DeleteFrameworkFromQueuing(nextWaiting.Key)
-	}
-	return nextWaiting
-}
-
-func (s *GlobalScheduler) ScheduleWaitingFramework(skdZone *SkdZone) *SkdFramework {
-	var nextPending *SkdFramework = nil
-	fwks := make([]*SkdFramework, 0)
-	ReadLock(skdZone.lockOfWaiting)
-	func() {
-		defer ReadUnlock(skdZone.lockOfWaiting)
-		for _, fwk := range skdZone.fmWaiting {
-			fwks = append(fwks, fwk)
-		}
-	}()
-	for _, fwk := range fwks {
-		if s.ResyncFrameworkQueuingTimestamp(fwk) {
-			if nextPending == nil {
-				nextPending = fwk
-			} else if fwk.QueuingTimestamp.Before(nextPending.QueuingTimestamp) {
-				nextPending = fwk
-			}
-		} else {
-			skdZone.DeleteFrameworkFromWaiting(fwk.Key)
-		}
-	}
-	if nextPending != nil {
-		WriteLock(s.lockOfPending)
-		func() {
-			defer WriteUnlock(s.lockOfPending)
-			s.fmPending[nextPending.Key] = nextPending
-			skdZone.AllocResourcesForFramework(nextPending)
-		}()
-		WriteLock(skdZone.lockOfWaiting)
-		func() {
-			defer WriteUnlock(skdZone.lockOfWaiting)
-			delete(skdZone.fmWaiting, nextPending.Key)
-			skdZone.FreeReservedResourcesOfFramework(nextPending)
-		}()
-	}
-	return nextPending
+	*/
 }
 
 func GetFrameworkAnnotation(f *ci.Framework, key string, defaultVal string) string {
@@ -1365,12 +1613,12 @@ func GetFrameworkResources(f *ci.Framework) SkdResourceRequirements {
 }
 
 // Only frameworks of Queuing state will do checkForWaiting
-func (s *GlobalScheduler) checkForWaiting(f *ci.Framework) bool {
+func (s *FrameworkScheduler) checkForWaiting(f *ci.Framework) (*SkdFramework, bool) {
 	key := f.Key()
-	ReadLock(s.lockOfWaiting)
-	defer ReadUnlock(s.lockOfWaiting)
-	_, ok := s.fmWaiting[key]
-	return ok
+	ReadLock(s.lockOnWaiting)
+	defer ReadUnlock(s.lockOnWaiting)
+	fwk, ok := s.fmWaiting[key]
+	return fwk, ok
 }
 
 func GetFrameworkQueuingTimestamp(f *ci.Framework) time.Time {
@@ -1391,7 +1639,6 @@ func NewSdkFramework(f *ci.Framework) *SkdFramework {
 		ScheduleCategory: category,
 		ScheduleZone:     zone,
 		QueuingTimestamp: queuingTimestamp,
-		ZoneKey:          "",
 		Zone:             nil,
 		Resources:        resources,
 		LastSync:         time.Now(),
@@ -1400,95 +1647,56 @@ func NewSdkFramework(f *ci.Framework) *SkdFramework {
 	return fwk
 }
 
-func (s *GlobalScheduler) addToQueuing(f *ci.Framework) bool {
-	key := f.Key()
-	fwk, ok := s.fmQueuing[key]
-	if !ok {
-		fwk := NewSdkFramework(f)
-		s.AddFrameworkToQueuing(fwk)
-		return true
-	}
+func (fwk *SkdFramework) resyncFramework(f *ci.Framework) {
 	// changing of preemption while changes QueuingTimestamp
 	fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
-	fwk.LastSync = time.Now()
 	// TODO: if resources will change ...
-	return false
+	fwk.LastSync = time.Now()
+}
+
+func (s *FrameworkScheduler) addToQueuing(f *ci.Framework) (*SkdFramework, bool) {
+	key := f.Key()
+	fwk, ok := s.fmQueuing[key]
+	if ok {
+		fwk.resyncFramework(f)
+	} else {
+		fwk = NewSdkFramework(f)
+		s.addFrameworkToQueuing(fwk)
+		log.Infof("scheduler: Add new framework %v to Queuing", key)
+	}
+	return fwk, ok
 }
 
 // Only frameworks in Waitting state will checkForPending
-func (s *GlobalScheduler) checkForPending(f *ci.Framework) bool {
+func (s *FrameworkScheduler) checkForPending(f *ci.Framework) (*SkdFramework, bool) {
 	key := f.Key()
-	ReadLock(s.lockOfPending)
-	defer ReadUnlock(s.lockOfPending)
-	_, ok := s.fmPending[key]
-	return ok
+	ReadLock(s.lockOnPending)
+	defer ReadUnlock(s.lockOnPending)
+	fwk, ok := s.fmPending[key]
+	return fwk, ok
 }
 
 // Frameworks in Pending state will be removed from fmPending
-func (s *GlobalScheduler) doneForPending(key string) {
-	WriteLock(s.lockOfPending)
-	defer WriteUnlock(s.lockOfPending)
+func (s *FrameworkScheduler) doneForPending(key string) {
+	WriteLock(s.lockOnPending)
+	defer WriteUnlock(s.lockOnPending)
 	if fwk, ok := s.fmPending[key]; ok {
-		fwk.Zone.FreeResourcesOfFramework(fwk)
+		fwk.Zone.freeResourcesOfFramework(fwk)
 		delete(s.fmPending, key)
 	}
 }
 
-func (s *GlobalScheduler) addToWaiting(f *ci.Framework) error {
-	key := f.Key()
-	fwk, ok := s.lookupWaitingFramework(key)
-	if !ok {
-		fwk := NewSdkFramework(f)
-		s.AddFrameworkToWaiting(fwk)
-		return nil
-	}
-
-	// changing of preemption while changes QueuingTimestamp
-	fwk.QueuingTimestamp = GetFrameworkQueuingTimestamp(f)
-	fwk.LastSync = time.Now()
-	// TODO: if resources will change ...
-
-	// Assign framework to zone only when framework in Waiting state
-	if fwk.Zone == nil && len(fwk.ZoneKey) > 0 {
-		fwk.Zone = s.lookupZoneByKey(fwk.ZoneKey)
-		if fwk.Zone != nil {
-			s.bindFrameworkToZone(f, fwk)
-		} else {
-			// Unreachable
-			log.Warnf("s.lookupZoneByKey(%v) return nil", fwk.ZoneKey)
-		}
-		s.enqueueZoneKey(fwk.ZoneKey)
-	}
-	return nil
-}
-
-func (s *GlobalScheduler) enqueueZonesForQueuing() {
-	zoneList := s.RefreshZoneList()
-	for _, skdZone := range zoneList {
-		if skdZone.HasFreeProvision() {
-			s.enqueueZoneKey(skdZone.Key)
-		}
-	}
-}
-
-func (s *GlobalScheduler) enqueueZonesForWaiting() {
-	zoneList := s.RefreshZoneList()
-	for _, skdZone := range zoneList {
-		if skdZone.HasFreeResources() {
-			s.enqueueZoneKey(skdZone.Key)
-		}
-	}
-}
-
-func (s *GlobalScheduler) bindFrameworkToZone(f *ci.Framework, fwk *SkdFramework) {
+func (s *FrameworkScheduler) bindFrameworkToZone(fwk *SkdFramework, f *ci.Framework) {
 	// f.Annotations[ci.AnnotationKeyScheduleCategory] == skdZone.ScheduleCategory
+	//SetFrameworkAnnotation(f, ci.AnnotationKeyScheduleZone, fwk.Zone.ScheduleZone)
 	if f.Annotations == nil {
 		f.Annotations = make(map[string]string)
 	}
 	f.Annotations[ci.AnnotationKeyScheduleZone] = fwk.Zone.ScheduleZone
+	s.enqueueZoneKey(fwk.Zone.Key)
 }
 
-func (s *GlobalScheduler) bindPodToZone(pod *core.Pod, f *ci.Framework) {
+func (s *FrameworkScheduler) bindPodToZone(pod *core.Pod, f *ci.Framework) {
 	category := GetFrameworkScheduleCategory(f)
 	zone := GetFrameworkScheduleZone(f)
 	if pod.Spec.NodeSelector == nil {
@@ -1502,20 +1710,21 @@ func (s *GlobalScheduler) bindPodToZone(pod *core.Pod, f *ci.Framework) {
 	}
 }
 
-func (s *GlobalScheduler) lookupWaitingFramework(key string) (fwk *SkdFramework, ok bool) {
-	ReadLock(s.lockOfWaiting)
+func (s *FrameworkScheduler) lookupFrameworkOnWaiting(key string) (fwk *SkdFramework, ok bool) {
+	ReadLock(s.lockOnWaiting)
 	func() {
-		defer ReadUnlock(s.lockOfWaiting)
+		defer ReadUnlock(s.lockOnWaiting)
 		fwk, ok = s.fmWaiting[key]
 	}()
 	if ok {
+		fwk.Zone.addFrameworkToWaiting(fwk)
 		return fwk, ok
 	}
-	zoneList := s.RefreshZoneList()
+	zoneList := s.refreshZoneList()
 	for _, skdZone := range zoneList {
-		ReadLock(skdZone.lockOfWaiting)
+		ReadLock(skdZone.lockOnWaiting)
 		func() {
-			defer ReadUnlock(skdZone.lockOfWaiting)
+			defer ReadUnlock(skdZone.lockOnWaiting)
 			fwk, ok = skdZone.fmWaiting[key]
 		}()
 		if ok {
@@ -1525,19 +1734,60 @@ func (s *GlobalScheduler) lookupWaitingFramework(key string) (fwk *SkdFramework,
 	return fwk, ok
 }
 
-func (s *GlobalScheduler) RefreshZoneList() []*SkdZone {
+func (s *FrameworkScheduler) refreshZoneList() []*SkdZone {
 	if s.lastRefreshedZoneList.After(s.lastModifiedZone) {
 		return s.zoneList
 	}
-	ReadLock(s.lockOfZones)
+	ReadLock(s.lockOnZones)
 	func() {
-		defer ReadUnlock(s.lockOfZones)
+		defer ReadUnlock(s.lockOnZones)
 		list := make([]*SkdZone, 0, len(s.zones))
 		for _, skdZone := range s.zones {
 			list = append(list, skdZone)
 		}
 		s.zoneList = list
 	}()
-	s.lastRefreshedZoneList = time.Now().Add(ci.TimeoutOfRefreshZoneList)
+	s.lastRefreshedZoneList = time.Now()
 	return s.zoneList
+}
+
+func (s *FrameworkScheduler) onFrameworkDeleted(key string) {
+	var fwk *SkdFramework
+	var ok bool
+	WriteLock(s.lockOnQueuing)
+	func() {
+		defer WriteUnlock(s.lockOnQueuing)
+		if fwk, ok = s.fmQueuing[key]; ok {
+			delete(s.fmQueuing, key)
+		}
+	}()
+	if ok {
+		return
+	}
+	WriteLock(s.lockOnWaiting)
+	func() {
+		defer WriteUnlock(s.lockOnWaiting)
+		if fwk, ok = s.fmWaiting[key]; ok {
+			delete(s.fmWaiting, key)
+		}
+	}()
+	if ok {
+		fwk.Zone.freeReservedResourcesOfFramework(fwk)
+		return
+	}
+	zoneList := s.refreshZoneList()
+	for _, skdZone := range zoneList {
+		WriteLock(skdZone.lockOnWaiting)
+		func() {
+			defer WriteUnlock(skdZone.lockOnWaiting)
+			if fwk, ok = skdZone.fmWaiting[key]; ok {
+				delete(skdZone.fmWaiting, key)
+			}
+		}()
+		if ok {
+			fwk.Zone.freeReservedResourcesOfFramework(fwk)
+			return
+		}
+	}
+	s.doneForPending(key)
 }

@@ -168,8 +168,8 @@ type FrameworkController struct {
 	//   is AddedAfter later with an earlier duration.
 	fQueue workqueue.RateLimitingInterface
 
-	// GlobalScheduler
-	scheduler *GlobalScheduler
+	// FrameworkScheduler
+	scheduler *FrameworkScheduler
 
 	// fExpectedStatusInfos is used to store the expected Framework.Status info for
 	// all Frameworks.
@@ -232,7 +232,7 @@ func NewFrameworkController() *FrameworkController {
 	// Using DefaultControllerRateLimiter to rate limit on both particular items and overall items.
 	fQueue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	scheduler := &GlobalScheduler{
+	scheduler := &FrameworkScheduler{
 		fmQueuing: make(map[string]*SkdFramework),
 		fmWaiting: make(map[string]*SkdFramework),
 		fmPending: make(map[string]*SkdFramework),
@@ -243,14 +243,14 @@ func NewFrameworkController() *FrameworkController {
 		nodeLister:   nodeLister,
 		fQueue:       fQueue,
 
-		lockOfQueuing: new(sync.RWMutex),
-		lockOfWaiting: new(sync.RWMutex),
-		lockOfPending: new(sync.RWMutex),
+		lockOnQueuing: new(sync.RWMutex),
+		lockOnWaiting: new(sync.RWMutex),
+		lockOnPending: new(sync.RWMutex),
 
-		lockOfHostIP: new(sync.RWMutex),
-		lockOfPods:   new(sync.RWMutex),
-		lockOfNodes:  new(sync.RWMutex),
-		lockOfZones:  new(sync.RWMutex),
+		lockOnHostIP: new(sync.RWMutex),
+		lockOnPods:   new(sync.RWMutex),
+		lockOnNodes:  new(sync.RWMutex),
+		lockOnZones:  new(sync.RWMutex),
 
 		hostIP2node: make(map[string]string),
 		nodes:       make(map[string]string),
@@ -467,6 +467,7 @@ func (c *FrameworkController) Run(stopCh <-chan struct{}) {
 	}
 	/**/
 	//	go NewInterdomScheduler(c).Run(stopCh)
+	go wait.Until(func() { c.scheduler.resyncFrameworks() }, time.Second * 10, stopCh)
 
 	<-stopCh
 }
@@ -906,32 +907,10 @@ func (c *FrameworkController) syncFrameworkState(f *ci.Framework) error {
 			f.TransitionFrameworkState(ci.FrameworkAttemptCreationPending)
 		}
 	}
-	// At this point, f.Status.State must be in:
-	// {FrameworkAttemptCreationPending, FrameworkAttemptPreparing,
-	// FrameworkAttemptRunning, FrameworkAttemptCreationWaiting/Queuing}
 
-	if f.Status.State == ci.FrameworkAttemptCreationQueuing {
-		if c.scheduler.checkForWaiting(f) {
-			f.TransitionFrameworkState(ci.FrameworkAttemptCreationWaiting)
-			log.Infof(logPfx+"Changing %v from Queuing to Waiting", f.Key())
-		} else {
-			if c.scheduler.addToQueuing(f) {
-				log.Infof(logPfx+"Add framework %v to Queuing", f.Key())
-			}
-			c.scheduler.enqueueZonesForQueuing()
-			return nil
-		}
-	}
-
-	if f.Status.State == ci.FrameworkAttemptCreationWaiting {
-		if c.scheduler.checkForPending(f) {
-			f.TransitionFrameworkState(ci.FrameworkAttemptCreationPending)
-		} else {
-			c.scheduler.addToWaiting(f)
-			log.Infof(logPfx+"Add framework %v to Waiting", f.Key())
-			c.scheduler.enqueueZonesForWaiting()
-			return nil
-		}
+	// for FrameworkAttemptCreationWaiting/Queuing
+	if c.scheduler.syncFrameworkState(f) {
+		return nil
 	}
 
 	// At this point, f.Status.State must be in:
@@ -1595,10 +1574,8 @@ func (c *FrameworkController) getExpectedFrameworkStatusInfo(key string) (
 func (c *FrameworkController) deleteExpectedFrameworkStatusInfo(key string) {
 	log.Infof("[%v]: deleteExpectedFrameworkStatusInfo: ", key)
 	delete(c.fExpectedStatusInfos, key)
-	// Cleanup Queuing, Waiting, and Pending framework in scheduler
-	c.scheduler.DeleteFrameworkFromQueuing(key)
-	c.scheduler.DeleteFrameworkFromWaiting(key)
-	c.scheduler.doneForPending(key)
+	// OpenI: Cleanup frameworks in scheduler
+	c.scheduler.onFrameworkDeleted(key)
 }
 
 func (c *FrameworkController) updateExpectedFrameworkStatusInfo(key string,

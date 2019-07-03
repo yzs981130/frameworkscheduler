@@ -571,3 +571,42 @@ const (
 	// [AssociatedState]
 	TaskCompleted TaskState = "Completed"
 )
+
+type RemoteState string
+
+const (
+	// [InitialState]
+	// -> RemoteWaking
+	RemoteHibernated RemoteState = ""
+
+	// Ready to start remote scheduling
+	// -> RemoteRequestAllowed
+	RemoteWaking RemoteState = "Waking"
+
+	// Allow Remote Site to send request for the framework
+	// [StartState]
+	// -> RemoteRequestRecieved
+	// -> RemoteHibernated
+	RemoteRequestAllowed RemoteState = "RequestAllowed"
+
+	// A request for the framework has been recieved
+	// -> RemoteRequestAccepted
+	// -> RemoteHibernated
+	RemoteRequestRecieved RemoteState = "RequestRecieved"
+
+	// Accept a request for the framework
+	// -> RemoteFrameworkCloning
+	// -> RemoteFrameworkFailed
+	// -> RemoteFrameworkCompleted
+	RemoteRequestAccepted RemoteState = "RequestAccepted"
+
+	// Remote site is cloning the framework
+	// -> RemoteFrameworkFailed
+	// -> RemoteFrameworkCompleted
+	RemoteFrameworkCloning RemoteState = "FrameworkCloning"
+
+	RemoteFrameworkFailed RemoteState = "FrameworkFailed"
+
+	RemoteFrameworkCompleted RemoteState = "FrameworkCompleted"
+
+)
