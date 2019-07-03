@@ -25,7 +25,6 @@ package v1
 import (
 	core "k8s.io/api/core/v1"
 	"os"
-	"time"
 )
 
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -63,35 +62,6 @@ const (
 	// Predefined Labels
 	LabelKeyFrameworkName = AnnotationKeyFrameworkName
 	LabelKeyTaskRoleName  = AnnotationKeyTaskRoleName
-
-	// For GlobalScheduler
-	QueueKeyPrefixNode string = "//node/"
-	QueueKeyPrefixPod  string = "//pod/"
-	QueueKeyPrefixZone string = "//zone/"
-
-	DefaultScheduleCategory string = "default"
-	DefaultScheduleZone     string = "default"
-	DefaultZoneKey          string = "default/default"
-
-	RemoteEnabled  string = "true"
-	RemoteDisabled string = "false"
-	RemoteEmpty    string = ""
-	RemoteDinied   string = "dinied"
-
-	AnnotationKeyScheduleCategory   string = "openi.cn/schedule-category"
-	AnnotationKeyScheduleZone       string = "openi.cn/schedule-zone"
-	AnnotationKeySchedulePreemption string = "openi.cn/schedule-preemption"
-	AnnotationKeyScheduleRemotable  string = "openi.cn/schedule-remotable"
-
-	LabelKeyScheduleCategory  string = AnnotationKeyScheduleCategory
-	LabelKeyScheduleZone      string = AnnotationKeyScheduleZone
-	LabelKeyScheduleRemotable string = AnnotationKeyScheduleRemotable
-	LabelKeyScheduleRemoted   string = "openi.cn/schedule-remoted"
-	LabelKeyRemoteRequest     string = "openi.cn/remote-request"
-	LabelKeyRemoteResponse    string = "openi.cn/remote-response"
-
-	TimeoutOfRefreshZoneList time.Duration = 100 * time.Millisecond
-	TimeoutOfFrameworkSync   time.Duration = 30 * time.Second
 
 	// For all managed containers
 	// Predefined Environment Variables

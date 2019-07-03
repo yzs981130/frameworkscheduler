@@ -48,7 +48,6 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -219,48 +218,15 @@ func NewFrameworkController() *FrameworkController {
 	cmListerInformer := kubeInformer.NewSharedInformerFactory(kClient, 0).Core().V1().ConfigMaps()
 	podListerInformer := kubeInformer.NewSharedInformerFactory(kClient, 0).Core().V1().Pods()
 	fListerInformer := frameworkInformer.NewSharedInformerFactory(fClient, 0).Frameworkcontroller().V1().Frameworks()
-	nodeListerInformer := kubeInformer.NewSharedInformerFactory(kClient, 0).Core().V1().Nodes()
 	cmInformer := cmListerInformer.Informer()
 	podInformer := podListerInformer.Informer()
 	fInformer := fListerInformer.Informer()
-	nodeInformer := nodeListerInformer.Informer()
 	cmLister := cmListerInformer.Lister()
 	podLister := podListerInformer.Lister()
 	fLister := fListerInformer.Lister()
-	nodeLister := nodeListerInformer.Lister()
 
 	// Using DefaultControllerRateLimiter to rate limit on both particular items and overall items.
 	fQueue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
-
-	scheduler := &FrameworkScheduler{
-		fmQueuing: make(map[string]*SkdFramework),
-		fmWaiting: make(map[string]*SkdFramework),
-		fmPending: make(map[string]*SkdFramework),
-
-		podLister:    podLister,
-		fLister:      fLister,
-		nodeInformer: nodeInformer,
-		nodeLister:   nodeLister,
-		fQueue:       fQueue,
-
-		lockOnQueuing: new(sync.RWMutex),
-		lockOnWaiting: new(sync.RWMutex),
-		lockOnPending: new(sync.RWMutex),
-
-		lockOnHostIP: new(sync.RWMutex),
-		lockOnPods:   new(sync.RWMutex),
-		lockOnNodes:  new(sync.RWMutex),
-		lockOnZones:  new(sync.RWMutex),
-
-		hostIP2node: make(map[string]string),
-		nodes:       make(map[string]string),
-		pods:        make(map[string]string),
-		zones:       make(map[string]*SkdZone),
-		zoneList:    make([]*SkdZone, 0),
-
-		lastModifiedZone:      time.Now(),
-		lastRefreshedZoneList: time.Now(),
-	}
 
 	c := &FrameworkController{
 		kConfig:              kConfig,
@@ -274,9 +240,11 @@ func NewFrameworkController() *FrameworkController {
 		podLister:            podLister,
 		fLister:              fLister,
 		fQueue:               fQueue,
-		scheduler:            scheduler,
 		fExpectedStatusInfos: map[string]*ExpectedFrameworkStatusInfo{},
 	}
+
+	// Create the framework scheduler
+	c.scheduler = NewFrameworkScheduler(c)
 
 	fInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
@@ -310,27 +278,18 @@ func NewFrameworkController() *FrameworkController {
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			c.enqueueFrameworkPodObj(obj, "Framework Pod Added")
-			scheduler.enqueuePodObj(obj, "(******) Pod Added")
+			// Handle events of pod by scheduler
+			c.scheduler.enqueuePodObj(obj, "(******) Pod Added")
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			c.enqueueFrameworkPodObj(newObj, "Framework Pod Updated")
-			scheduler.enqueuePodObj(newObj, "(******) Pod Updated")
+			// Handle events of pod by scheduler
+			c.scheduler.enqueuePodObj(newObj, "(******) Pod Updated")
 		},
 		DeleteFunc: func(obj interface{}) {
 			c.enqueueFrameworkPodObj(obj, "Framework Pod Deleted")
-			scheduler.enqueuePodObj(obj, "(******) Pod Deleted")
-		},
-	})
-
-	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			scheduler.enqueueNodeObj(obj, "(******) Node Added")
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			scheduler.enqueueNodeObj(newObj, "(******) Node Updated")
-		},
-		DeleteFunc: func(obj interface{}) {
-			scheduler.enqueueNodeObj(obj, "(******) Node Deleted")
+			// Handle events of pod by scheduler
+			c.scheduler.enqueuePodObj(obj, "(******) Pod Deleted")
 		},
 	})
 
@@ -432,7 +391,6 @@ func (c *FrameworkController) getPodOwner(pod *core.Pod) *core.ConfigMap {
 }
 
 func (c *FrameworkController) Run(stopCh <-chan struct{}) {
-	/**/
 	defer c.fQueue.ShutDown()
 	defer log.Errorf("Stopping " + ci.ComponentName)
 	defer runtime.HandleCrash()
@@ -465,9 +423,9 @@ func (c *FrameworkController) Run(stopCh <-chan struct{}) {
 		id := i
 		go wait.Until(func() { c.worker(id) }, time.Second, stopCh)
 	}
-	/**/
-	//	go NewInterdomScheduler(c).Run(stopCh)
-	go wait.Until(func() { c.scheduler.resyncFrameworks() }, time.Second * 10, stopCh)
+
+	// Periodically resync frameworks in scheduler with the cache to get changes of CRD frameworks
+	go wait.Until(func() { c.scheduler.resyncFrameworks() }, time.Second*10, stopCh)
 
 	<-stopCh
 }
@@ -492,16 +450,9 @@ func (c *FrameworkController) processNextWorkItem(id int32) bool {
 	// same item again.
 	defer c.fQueue.Done(key)
 
-	var err error
-	if HasPrefixPod(key) {
-		err = c.scheduler.syncPod(GetPodKey(key))
-	} else if HasPrefixNode(key) {
-		err = c.scheduler.syncNode(GetNodeKey(key))
-	} else if HasPrefixZone(key) {
-		err = c.scheduler.syncZone(GetZoneKey(key))
-	} else {
-		err = c.syncFramework(key.(string))
-	}
+	// sync with Framework, Pod, Node or Zone by check the prefix of key
+	err := c.scheduler.syncAll(key.(string))
+
 	if err == nil {
 		// Reset the rate limit counters of the item in the queue, such as NumRequeues,
 		// because we have synced it successfully.
@@ -1479,6 +1430,7 @@ func (c *FrameworkController) createPod(
 	f *ci.Framework, cm *core.ConfigMap,
 	taskRoleName string, taskIndex int32) (*core.Pod, error) {
 	pod := f.NewPod(cm, taskRoleName, taskIndex)
+	// Bind pod to zone by the scheduler
 	c.scheduler.bindPodToZone(pod, f)
 	remotePod, err := c.kClient.CoreV1().Pods(f.Namespace).Create(pod)
 	if err != nil {

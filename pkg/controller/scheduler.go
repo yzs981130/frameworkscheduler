@@ -26,9 +26,9 @@ import (
 	"fmt"
 	ci "github.com/microsoft/frameworkcontroller/pkg/apis/frameworkcontroller/v1"
 	//frameworkClient "github.com/microsoft/frameworkcontroller/pkg/client/clientset/versioned"
-	frameworkInformer "github.com/microsoft/frameworkcontroller/pkg/client/informers/externalversions"
-	frameworkLister "github.com/microsoft/frameworkcontroller/pkg/client/listers/frameworkcontroller/v1"
-	"github.com/microsoft/frameworkcontroller/pkg/common"
+	//frameworkInformer "github.com/microsoft/frameworkcontroller/pkg/client/informers/externalversions"
+	//frameworkLister "github.com/microsoft/frameworkcontroller/pkg/client/listers/frameworkcontroller/v2"
+	//"github.com/microsoft/frameworkcontroller/pkg/common"
 	"github.com/microsoft/frameworkcontroller/pkg/util"
 	//errorWrap "github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -37,15 +37,15 @@ import (
 	//meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	//"k8s.io/apimachinery/pkg/types"
 	//errorAgg "k8s.io/apimachinery/pkg/util/errors"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
-	//kubeInformer "k8s.io/client-go/informers"
+	//"k8s.io/apimachinery/pkg/util/runtime"
+	//"k8s.io/apimachinery/pkg/util/wait"
+	kubeInformer "k8s.io/client-go/informers"
 	//kubeClient "k8s.io/client-go/kubernetes"
 	coreLister "k8s.io/client-go/listers/core/v1"
 	//"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	//"k8s.io/client-go/util/retry"
-	"k8s.io/client-go/util/workqueue"
+	//"k8s.io/client-go/util/workqueue"
 	//"reflect"
 	"sort"
 	"strconv"
@@ -92,21 +92,22 @@ type SkdPod struct {
 }
 
 type SkdFramework struct {
-	Key               string
-	Name              string
-	Namespace         string
-	ScheduleCategory  string
-	ScheduleZone      string
-	ScheduleRemoteble string
-	QueuingTimestamp  time.Time
-	Zone              *SkdZone
-	Resources         SkdResourceRequirements
-	LastSync          time.Time
-	Remote            struct {
-		Host    string
-		State   ci.RemoteState
-		Request string
-	}
+	Key              string
+	Name             string
+	Namespace        string
+	ScheduleCategory string
+	ScheduleZone     string
+	QueuingTimestamp time.Time
+	Zone             *SkdZone
+	Resources        SkdResourceRequirements
+	LastSync         time.Time
+
+	//ScheduleRemoteble string
+	//Remote            struct {
+	//	Host    string
+	//	State   ci.RemoteState
+	//	Request string
+	//}
 }
 
 type SkdZone struct {
@@ -128,21 +129,17 @@ type SkdZone struct {
 }
 
 type FrameworkScheduler struct {
-	fmQueuing  map[string]*SkdFramework
-	fmWaiting  map[string]*SkdFramework
-	fmPending  map[string]*SkdFramework
-	fmRemoting map[string]*SkdFramework
+	fmQueuing map[string]*SkdFramework
+	fmWaiting map[string]*SkdFramework
+	fmPending map[string]*SkdFramework
 
-	podLister    coreLister.PodLister
-	fLister      frameworkLister.FrameworkLister
 	nodeInformer cache.SharedIndexInformer
 	nodeLister   coreLister.NodeLister
-	fQueue       workqueue.RateLimitingInterface
+	c            *FrameworkController
 
-	lockOnQueuing  *sync.RWMutex
-	lockOnWaiting  *sync.RWMutex
-	lockOnPending  *sync.RWMutex
-	lockOnRemoting *sync.RWMutex
+	lockOnQueuing *sync.RWMutex
+	lockOnWaiting *sync.RWMutex
+	lockOnPending *sync.RWMutex
 
 	lockOnHostIP *sync.RWMutex
 	lockOnNodes  *sync.RWMutex
@@ -158,123 +155,58 @@ type FrameworkScheduler struct {
 	lastModifiedZone      time.Time
 	lastRefreshedZoneList time.Time
 	oldestSyncTime        time.Time
+
+	//lockOnRemoting *sync.RWMutex
+	//fmRemoting     map[string]*SkdFramework
 }
 
-type InterdomScheduler struct {
-	mapfcs       map[string]*FrameworkController
-	myfc         *FrameworkController
-	fRemoteQueue workqueue.RateLimitingInterface
-}
+func NewFrameworkScheduler(c *FrameworkController) *FrameworkScheduler {
 
-func NewInterdomScheduler(myfc *FrameworkController) *InterdomScheduler {
-	fRemoteQueue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
-	is := &InterdomScheduler{
-		mapfcs:       make(map[string]*FrameworkController),
-		myfc:         myfc,
-		fRemoteQueue: fRemoteQueue,
-	}
-	cConfigs := ci.NewRemoteConfigs()
-	for _, cConfig := range cConfigs {
-		kConfig := ci.BuildKubeConfig(cConfig)
-		host := kConfig.Host
-		if _, ok := is.mapfcs[host]; ok {
-			common.LogLines("Duplicated host: %v", host)
-			continue
-		}
-		kClient, fClient := util.CreateClients(kConfig)
-		fListerInformer := frameworkInformer.NewSharedInformerFactory(fClient,
-			0).Frameworkcontroller().V1().Frameworks()
-		fInformer := fListerInformer.Informer()
-		fLister := fListerInformer.Lister()
-		fc := &FrameworkController{
-			kConfig:   kConfig,
-			cConfig:   cConfig,
-			kClient:   kClient,
-			fClient:   fClient,
-			fInformer: fInformer,
-			fLister:   fLister,
-		}
-		fInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc: func(obj interface{}) {
-				is.onRemoveFrameworkAdd(obj, fc)
-			},
-			UpdateFunc: func(oldObj, newObj interface{}) {
-				is.onRemoveFrameworkUpdate(newObj, fc)
-			},
-			DeleteFunc: func(obj interface{}) {
-				is.onRemoveFrameworkDelete(obj, fc)
-			},
-		})
-		is.mapfcs[host] = fc
-	}
-	return is
-}
+	nodeListerInformer := kubeInformer.NewSharedInformerFactory(c.kClient, 2).Core().V1().Nodes()
+	nodeInformer := nodeListerInformer.Informer()
+	nodeLister := nodeListerInformer.Lister()
 
-func GetFrameworkKey(obj interface{}) string {
-	key, err := util.GetKey(obj)
-	if err != nil {
-		log.Errorf("Failed to get key for obj %#v, skip to enqueue: %v", obj, err)
-		return ""
+	scheduler := &FrameworkScheduler{
+		fmQueuing: make(map[string]*SkdFramework),
+		fmWaiting: make(map[string]*SkdFramework),
+		fmPending: make(map[string]*SkdFramework),
+
+		nodeInformer: nodeInformer,
+		nodeLister:   nodeLister,
+		c:            c,
+
+		lockOnQueuing: new(sync.RWMutex),
+		lockOnWaiting: new(sync.RWMutex),
+		lockOnPending: new(sync.RWMutex),
+
+		lockOnHostIP: new(sync.RWMutex),
+		lockOnPods:   new(sync.RWMutex),
+		lockOnNodes:  new(sync.RWMutex),
+		lockOnZones:  new(sync.RWMutex),
+
+		hostIP2node: make(map[string]string),
+		nodes:       make(map[string]string),
+		pods:        make(map[string]string),
+		zones:       make(map[string]*SkdZone),
+		zoneList:    make([]*SkdZone, 0),
+
+		lastModifiedZone:      time.Now(),
+		lastRefreshedZoneList: time.Now(),
 	}
 
-	_, _, err = util.SplitKey(key)
-	if err != nil {
-		log.Errorf("Got invalid key %v for obj %#v, skip to enqueue: %v", key, obj, err)
-		return ""
-	}
+	nodeInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			scheduler.enqueueNodeObj(obj, "(******) Node Added")
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			scheduler.enqueueNodeObj(newObj, "(******) Node Updated")
+		},
+		DeleteFunc: func(obj interface{}) {
+			scheduler.enqueueNodeObj(obj, "(******) Node Deleted")
+		},
+	})
 
-	return key
-}
-
-func (is *InterdomScheduler) onRemoveFrameworkAdd(obj interface{}, fc *FrameworkController) {
-	key := GetFrameworkKey(obj)
-	log.Infof("[%v] onRemoveFrameworkAdd: %v", key, fc.kConfig.Host)
-}
-
-func (is *InterdomScheduler) onRemoveFrameworkUpdate(obj interface{}, fc *FrameworkController) {
-	key := GetFrameworkKey(obj)
-	log.Infof("[%v] onRemoveFrameworkUpdate: %v", key, fc.kConfig.Host)
-}
-
-func (is *InterdomScheduler) onRemoveFrameworkDelete(obj interface{}, fc *FrameworkController) {
-	key := GetFrameworkKey(obj)
-	log.Infof("[%v] onRemoveFrameworkDelete: %v", key, fc.kConfig.Host)
-}
-
-func (is *InterdomScheduler) worker(fc *FrameworkController, id int32) {
-}
-
-func (is *InterdomScheduler) Run(stopCh <-chan struct{}) {
-	defer is.fRemoteQueue.ShutDown()
-	defer log.Errorf("InterdomScheduler Stopping " + ci.ComponentName)
-	defer runtime.HandleCrash()
-
-	for _, fc := range is.mapfcs {
-		log.Infof("InterdomScheduler Recovering " + fc.kConfig.Host)
-		util.PutCRD(
-			fc.kConfig,
-			ci.BuildFrameworkCRD(),
-			fc.cConfig.CRDEstablishedCheckIntervalSec,
-			fc.cConfig.CRDEstablishedCheckTimeoutSec)
-
-		go fc.fInformer.Run(stopCh)
-		if !cache.WaitForCacheSync(
-			stopCh,
-			fc.fInformer.HasSynced) {
-			log.Errorf("Failed to WaitForCacheSync for %v", fc.kConfig.Host)
-		}
-
-		log.Infof("Running %v with %v workers for host %v",
-			ci.ComponentName, *fc.cConfig.WorkerNumber, fc.kConfig.Host)
-
-		for i := int32(0); i < *fc.cConfig.WorkerNumber; i++ {
-			// id is dedicated for each iteration, while i is not.
-			id := i
-			go wait.Until(func() { is.worker(fc, id) }, time.Second, stopCh)
-		}
-	}
-
-	<-stopCh
+	return scheduler
 }
 
 // obj could be *core.Pod or cache.DeletedFinalStateUnknown.
@@ -315,16 +247,16 @@ func (s *FrameworkScheduler) enqueueZoneKey(key string) {
 }
 
 func (s *FrameworkScheduler) enqueueKey(prefix string, key string) {
-	s.fQueue.AddRateLimited(fmt.Sprintf("%v%v", prefix, key))
+	s.c.fQueue.AddRateLimited(fmt.Sprintf("%v%v", prefix, key))
 }
 
 func (s *FrameworkScheduler) enqueueFrameworkKey(key string) {
-	s.fQueue.AddRateLimited(key)
+	s.c.fQueue.AddRateLimited(key)
 }
 
 func (s *FrameworkScheduler) enqueueKeyAfter(key string, after int64) {
 	duration := time.Duration(int64(time.Second) * after)
-	s.fQueue.AddAfter(key, duration)
+	s.c.fQueue.AddAfter(key, duration)
 }
 
 func HasPrefixPod(key interface{}) bool {
@@ -589,7 +521,7 @@ func (s *FrameworkScheduler) syncPod(key string) (returnedErr error) {
 			"valid keys: %v", err))
 	}
 
-	pod, err := s.podLister.Pods(namespace).Get(name)
+	pod, err := s.c.podLister.Pods(namespace).Get(name)
 	if err != nil {
 		if apiErrors.IsNotFound(err) {
 			// GarbageCollectionController will handle the dependent object
@@ -1121,26 +1053,6 @@ func (s *FrameworkScheduler) scheduleNewFrameworkOnWaiting(fwk *SkdFramework, f 
 	skdZone.addFrameworkToWaiting(fwk)
 }
 
-func (s *FrameworkScheduler) scheduleRemotableFramework(category string) []*SkdFramework {
-	ReadLock(s.lockOnQueuing)
-	WriteLock(s.lockOnRemoting)
-	defer func() {
-		WriteUnlock(s.lockOnRemoting)
-		ReadUnlock(s.lockOnQueuing)
-	}()
-	var fwks []*SkdFramework
-	for key, fwk := range s.fmQueuing {
-		if fwk.ScheduleCategory == category &&
-			fwk.ScheduleRemoteble == ci.RemoteEnabled &&
-			fwk.Remote.State == ci.RemoteHibernated {
-			fwks = append(fwks, fwk)
-			s.fmRemoting[key] = fwk
-			fwk.Remote.State = ci.RemoteWaking
-		}
-	}
-	return fwks
-}
-
 func (z *SkdZone) RefreshTotalCapacity() {
 	var keys []string
 	totalCapacity := SkdResources{0, 0, 0}
@@ -1396,7 +1308,7 @@ func (s *FrameworkScheduler) resyncFrameworks() {
 		now := time.Now()
 		for _, fwk := range fwks {
 			if now.Sub(fwk.LastSync) > ci.TimeoutOfFrameworkSync {
-				f, err := s.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
+				f, err := s.c.fLister.Frameworks(fwk.Namespace).Get(fwk.Name)
 				if err != nil {
 					if apiErrors.IsNotFound(err) {
 						s.enqueueFrameworkKey(fwk.Key)
@@ -1468,11 +1380,24 @@ func (s *FrameworkScheduler) scheduleZoneForPending(skdZone *SkdZone) {
 	}
 }
 
+func (s *FrameworkScheduler) syncAll(key string) (err error) {
+	if HasPrefixPod(key) {
+		err = s.syncPod(GetPodKey(key))
+	} else if HasPrefixNode(key) {
+		err = s.syncNode(GetNodeKey(key))
+	} else if HasPrefixZone(key) {
+		err = s.syncZone(GetZoneKey(key))
+	} else {
+		err = s.c.syncFramework(key)
+	}
+	return err
+}
+
 func (s *FrameworkScheduler) syncFrameworkState(f *ci.Framework) bool {
-	/*/ TODO: Preschedule for remote
-	if s.syncRemoteState(f) {
-		return true
-	} /*/
+	// TODO: Preschedule sync for remote
+	//if s.syncRemoteState(f) {
+	//	return true
+	//} /**/
 
 	if f.Status.State == ci.FrameworkAttemptCreationQueuing {
 		fwk, exists := s.checkForWaiting(f)
@@ -1517,101 +1442,6 @@ func (s *FrameworkScheduler) syncFrameworkState(f *ci.Framework) bool {
 			}
 			return true
 		}
-	}
-	return false
-}
-
-func GetFrameworkLabel(f *ci.Framework, key string) string {
-	if value, ok := f.Labels[key]; ok {
-		return value
-	}
-	return ""
-}
-
-func SetFrameworkLabel(f *ci.Framework, key string, value string) {
-	if f.Labels == nil {
-		f.Labels = make(map[string]string)
-	}
-	f.Labels[key] = value
-}
-
-func (fwk *SkdFramework) transitionRemoteState(newState ci.RemoteState) {
-	fwk.Remote.State = newState
-}
-
-func (s *FrameworkScheduler) lookupRemotingFramework(key string) *SkdFramework {
-	ReadLock(s.lockOnRemoting)
-	defer ReadUnlock(s.lockOnRemoting)
-	if fwk, ok := s.fmRemoting[key]; ok {
-		return fwk
-	}
-	return nil
-}
-
-func (s *FrameworkScheduler) syncRemoteState(f *ci.Framework) bool {
-	fwk := s.lookupRemotingFramework(f.Key())
-	if fwk == nil {
-		if f.Status.State == ci.FrameworkAttemptCreationRemoting {
-			// TODO: Recovering from restart of framework controler
-			f.TransitionFrameworkState(ci.FrameworkAttemptCreationQueuing)
-		}
-		return false
-	}
-	fwk.resyncFramework(f)
-	defer func() {
-		if fwk.Remote.State == ci.RemoteWaking {
-			s.enqueueKeyAfter(fwk.Key, 1)
-		} else if fwk.Remote.State == ci.RemoteRequestAllowed {
-			s.enqueueKeyAfter(fwk.Key, 3)
-		} else {
-			s.enqueueKeyAfter(fwk.Key, 5)
-		}
-	}()
-	if fwk.Remote.State == ci.RemoteWaking {
-		SetFrameworkLabel(f, ci.LabelKeyScheduleRemotable, ci.RemoteEnabled)
-		SetFrameworkLabel(f, ci.LabelKeyScheduleRemoted, ci.RemoteEmpty)
-		SetFrameworkLabel(f, ci.LabelKeyRemoteRequest, ci.RemoteEmpty)
-		SetFrameworkLabel(f, ci.LabelKeyRemoteResponse, ci.RemoteEmpty)
-		fwk.transitionRemoteState(ci.RemoteRequestAllowed)
-		return true
-	} else if fwk.Remote.State == ci.RemoteRequestAllowed {
-		request := GetFrameworkLabel(f, ci.LabelKeyRemoteRequest)
-		if request != ci.RemoteEmpty {
-			fwk.Remote.Host = request
-			fwk.Remote.Request = request
-			fwk.transitionRemoteState(ci.RemoteRequestRecieved)
-			if f.Status.State == ci.FrameworkAttemptCreationQueuing {
-				f.TransitionFrameworkState(ci.FrameworkAttemptCreationRemoting)
-				s.deleteFrameworkFromQueuing(fwk.Key)
-				return true
-			}
-		}
-		if f.Status.State != ci.FrameworkAttemptCreationQueuing {
-			SetFrameworkLabel(f, ci.LabelKeyScheduleRemoted, ci.RemoteDinied)
-			fwk.transitionRemoteState(ci.RemoteRequestDenied)
-		}
-		return false
-	} else if fwk.Remote.State == ci.RemoteRequestRecieved {
-		return false
-	} else if fwk.Remote.State == ci.RemoteRequestRecieved {
-		if f.Status.State == ci.FrameworkAttemptCreationRemoting {
-			if fwk.Zone != nil {
-				if _, exists := s.checkForWaiting(f); exists {
-					s.deleteFrameworkFromWaiting(fwk.Key)
-				} else {
-					fwk.Zone.deleteFrameworkFromWaiting(fwk.Key)
-				}
-				fwk.Zone.freeReservedResourcesOfFramework(fwk)
-				fwk.Zone = nil
-			}
-			SetFrameworkLabel(f, ci.LabelKeyScheduleRemoted, fwk.Remote.Request)
-			fwk.transitionRemoteState(ci.RemoteRequestAccepted)
-			return true
-		}
-		panic(fmt.Sprintf("f.Status.State should be %v while fwk.Remote.State is %v!",
-			ci.FrameworkAttemptCreationRemoting,
-			ci.RemoteRequestRecieved))
-		return false
 	}
 	return false
 }

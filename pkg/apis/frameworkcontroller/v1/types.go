@@ -24,15 +24,15 @@ package v1
 
 import (
 	core "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 type FrameworkList struct {
-	meta.TypeMeta     `json:",inline"`
-	meta.ListMeta     `json:"metadata"`
-	Items []Framework `json:"items"`
+	meta.TypeMeta `json:",inline"`
+	meta.ListMeta `json:"metadata"`
+	Items         []Framework `json:"items"`
 }
 
 // +genclient
@@ -79,10 +79,10 @@ type FrameworkList struct {
 //    2. Do not change the OwnerReferences of the managed ConfigMap and Pods.
 //////////////////////////////////////////////////////////////////////////////////////////////////
 type Framework struct {
-	meta.TypeMeta           `json:",inline"`
-	meta.ObjectMeta         `json:"metadata"`
-	Spec   FrameworkSpec    `json:"spec"`
-	Status *FrameworkStatus `json:"status"`
+	meta.TypeMeta   `json:",inline"`
+	meta.ObjectMeta `json:"metadata"`
+	Spec            FrameworkSpec    `json:"spec"`
+	Status          *FrameworkStatus `json:"status"`
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -405,19 +405,20 @@ const (
 type FrameworkState string
 
 const (
-        // ConfigMap does not exist and
-        // has not been creation pending.
-        // [StartState]
-        // -> FrameworkAttemptCreationWaiting
-        FrameworkAttemptCreationQueuing FrameworkState = "AttemptCreationQueuing"
+	// ConfigMap does not exist and
+	// has not been creation pending.
+	// [StartState]
+	// -> FrameworkAttemptCreationWaiting
+	FrameworkAttemptCreationQueuing FrameworkState = "AttemptCreationQueuing"
 
-        // ConfigMap does not exist and
-        // has not been creation pending.
-        // [WatingState]
-        // -> FrameworkAttemptCreationPending
-        FrameworkAttemptCreationWaiting FrameworkState = "AttemptCreationWaiting"
+	// ConfigMap does not exist and
+	// has not been creation pending.
+	// [WatingState]
+	// -> FrameworkAttemptCreationPending
+	FrameworkAttemptCreationWaiting FrameworkState = "AttemptCreationWaiting"
 
-		FrameworkAttemptCreationRemoting FrameworkState = "AttemptCreationRemoting"
+	// TODO for remote
+	FrameworkAttemptCreationRemoting FrameworkState = "AttemptCreationRemoting"
 
 	// ConfigMap does not exist and
 	// has not been creation requested.
@@ -572,45 +573,4 @@ const (
 	// [FinalState]
 	// [AssociatedState]
 	TaskCompleted TaskState = "Completed"
-)
-
-type RemoteState string
-
-const (
-	// [InitialState]
-	// -> RemoteWaking
-	RemoteHibernated RemoteState = ""
-
-	// Ready to start remote scheduling
-	// -> RemoteRequestAllowed
-	RemoteWaking RemoteState = "Waking"
-
-	// Allow Remote Site to send request for the framework
-	// [StartState]
-	// -> RemoteRequestRecieved
-	// -> RemoteHibernated
-	RemoteRequestAllowed RemoteState = "RequestAllowed"
-
-	// A request for the framework has been recieved
-	// -> RemoteRequestAccepted
-	// -> RemoteHibernated
-	RemoteRequestRecieved RemoteState = "RequestRecieved"
-
-	// Accept a request for the framework
-	// -> RemoteFrameworkCloning
-	// -> RemoteFrameworkFailed
-	// -> RemoteFrameworkCompleted
-	RemoteRequestAccepted RemoteState = "RequestAccepted"
-	RemoteRequestDenied RemoteState = "RequestDenied"
-	RemoteRequestCanceled RemoteState = "RequestCanceled"
-
-	// Remote site is cloning the framework
-	// -> RemoteFrameworkFailed
-	// -> RemoteFrameworkCompleted
-	RemoteFrameworkCloning RemoteState = "FrameworkCloning"
-
-	RemoteFrameworkFailed RemoteState = "FrameworkFailed"
-
-	RemoteFrameworkCompleted RemoteState = "FrameworkCompleted"
-
 )
